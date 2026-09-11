@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pdf_oxide = "0.3"
 quick-xml = "0.36"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
