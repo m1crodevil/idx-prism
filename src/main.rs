@@ -80,13 +80,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         pdf_appraisal_date = extracted.appraisal_date;
         pdf_property_location_composition = extracted.property_location_composition;
 
-        // Fallback: jika policy_text di XBRL hanya pointer generik / kosong
-        if policy_text.trim().to_lowercase().starts_with("idem row")
+        // Fallback: jika policy_text di XBRL berupa pointer ("Idem row"), kosong,
+        // atau tidak menghasilkan klasifikasi model yang jelas (unknown)
+        if accounting_model == "unknown"
+            || policy_text.trim().to_lowercase().starts_with("idem row")
             || policy_text.trim().len() < 20
         {
-            if let Some(pdf_policy) = extracted.accounting_policy {
-                policy_text = pdf_policy;
-                accounting_model = detect_model(&policy_text);
+            if let Some(ref pdf_policy) = extracted.accounting_policy {
+                let model_from_pdf = detect_model(pdf_policy);
+                if model_from_pdf != "unknown" {
+                    accounting_model = model_from_pdf;
+                    if policy_text.trim().len() < 20
+                        || policy_text.trim().to_lowercase().starts_with("idem row")
+                    {
+                        policy_text = pdf_policy.clone();
+                    }
+                }
             }
         }
     }
@@ -242,7 +251,6 @@ fn parse_numeric_facts(xml: &[u8]) -> Result<XbrlNumericFacts, Box<dyn Error>> {
                             facts.equity = read_text_num(&mut reader)?;
                         }
                         "SalesAndRevenue" | "Revenues" if is_current_duration => {
-                            // Ambil hanya jika belum terisi atau konsolidasi agregat
                             if facts.revenues.is_none() {
                                 facts.revenues = read_text_num(&mut reader)?;
                             }
@@ -274,8 +282,9 @@ fn parse_policy_text(xml: &[u8]) -> Option<String> {
 
     // ponytail: fallback regex karena quick-xml miss tag plural idx-cor:InvestmentPropertiesTextBlock
     let plural = Regex::new(
-        r"(?s)<([\w-]+:)?InvestmentPropertiesTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertiesTextBlock>"
-    ).ok()?;
+        r"(?s)<([\w-]+:)?InvestmentPropertiesTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertiesTextBlock>",
+    )
+    .ok()?;
     if let Some(m) = plural.captures(&text) {
         let raw = m.get(2)?.as_str();
         if !raw.trim().is_empty() {
@@ -284,8 +293,9 @@ fn parse_policy_text(xml: &[u8]) -> Option<String> {
     }
 
     let singular = Regex::new(
-        r"(?s)<([\w-]+:)?InvestmentPropertyTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertyTextBlock>"
-    ).ok()?;
+        r"(?s)<([\w-]+:)?InvestmentPropertyTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertyTextBlock>",
+    )
+    .ok()?;
     if let Some(m) = singular.captures(&text) {
         let raw = m.get(2)?.as_str();
         if !raw.trim().is_empty() {
@@ -366,13 +376,14 @@ mod pdf_extract {
     pub fn extract_pdf_fields<P: AsRef<Path>>(path: P) -> Result<PdfExtracted, Box<dyn Error>> {
         let text = extract_pdf_text(path)?;
         let lower = text.to_lowercase();
+        let ip_region = investment_property_region(&text, &lower);
 
         Ok(PdfExtracted {
-            fair_value_amount: extract_fair_value_amount(&text, &lower),
-            appraiser_name: extract_appraiser_name(&text, &lower),
-            appraisal_date: extract_appraisal_date(&text, &lower),
-            property_location_composition: extract_property_location(&text, &lower),
-            accounting_policy: extract_accounting_policy(&text, &lower),
+            fair_value_amount: extract_fair_value_amount(ip_region),
+            appraiser_name: extract_appraiser_name(ip_region),
+            appraisal_date: extract_appraisal_date(ip_region),
+            property_location_composition: extract_property_location(ip_region),
+            accounting_policy: extract_accounting_policy(&text),
         })
     }
 
@@ -390,13 +401,38 @@ mod pdf_extract {
         Ok(text)
     }
 
-    fn extract_fair_value_amount(text: &str, lower: &str) -> Option<String> {
+    fn investment_property_region<'a>(text: &'a str, lower: &'a str) -> &'a str {
+        let markers = [
+            "nilai wajar properti investasi",
+            "fair values of certain investment properties",
+            "16. properti investasi",
+            "16. investment properties",
+            "14. investment properties",
+            "14. properti investasi",
+            "13. investment properties",
+            "13. properti investasi",
+            "10. properti investasi",
+            "10. investment properties",
+            "properti investasi - neto",
+            "properti investasi",
+        ];
+        for marker in markers {
+            if let Some(pos) = lower.find(marker) {
+                let end = text.len().min(pos + 35000);
+                return &text[pos..end];
+            }
+        }
+        text
+    }
+
+    fn extract_fair_value_amount(text: &str) -> Option<String> {
+        let lower = text.to_lowercase();
         if !lower.contains("nilai wajar") && !lower.contains("fair value") {
             return None;
         }
 
         let re = Regex::new(
-            r"(?i)(nilai wajar[\s\S]{0,120}?properti investasi[\s\S]{0,150}?(?:sebesar|amounted to)\s*(?:Rp\.?\s*)?[\d.,]+[\s\S]{0,350}?\.\s)",
+            r"(?i)(nilai wajar[\s\S]{0,120}?properti investasi[\s\S]{0,150}?(?:sebesar|amounted to)\s*(?:Rp\.?\s*)?[\d.,]+[^\n.]{0,80}?(?:ribu|jutaan)?[\s\S]{0,350}?\.\s)",
         )
         .ok()?;
         if let Some(m) = re.find(text) {
@@ -412,7 +448,7 @@ mod pdf_extract {
         }
 
         let re = Regex::new(
-            r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\s\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s",
+            r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\\s\\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s",
         )
         .ok()?;
         if let Some(m) = re.find(text) {
@@ -429,29 +465,48 @@ mod pdf_extract {
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
-    fn extract_appraiser_name(text: &str, _lower: &str) -> Option<String> {
+    fn extract_appraiser_name(text: &str) -> Option<String> {
+        // Pattern 1: Temukan KJPP langsung dalam region catatan properti investasi
+        let re_kjpp = Regex::new(
+            r"(?i)(KJPP\s+[A-Za-z0-9\s&,–-]{3,60}?(?:Rekan|\(Rengganis\)|\(Putri\)|dan Rekan|& Rekan))",
+        )
+        .ok()?;
+        let mut appraisers = Vec::new();
+        for caps in re_kjpp.captures_iter(text) {
+            if let Some(m) = caps.get(1) {
+                let name = m.as_str().replace('\n', " ").trim().to_string();
+                if !appraisers.contains(&name) {
+                    appraisers.push(name);
+                }
+            }
+        }
+        if !appraisers.is_empty() {
+            return Some(appraisers.join(", "));
+        }
+
+        // Pattern 2: Fallback kalimat umum penilai independen
         let re = Regex::new(
-            r"(?i)(?:nilai wajar properti investasi|fair values of certain investment properties)[\s\S]{0,180}((?:penilai independen|independent appraisers)[\s\S]{0,350}?)\.\s"
-        ).ok()?;
+            r"(?i)(?:nilai wajar properti investasi|fair values of certain investment properties)[\s\S]{0,180}((?:penilai independen|independent appraisers)[\\s\\S]{0,350}?)\.\s",
+        )
+        .ok()?;
         if let Some(caps) = re.captures(text) {
             if let Some(m) = caps.get(1) {
                 return Some(m.as_str().trim().to_string());
             }
         }
 
-        let re = Regex::new(r"(?i)(?:penilai independen|independent appraisers)[\s\S]{0,350}?\.\s")
-            .ok()?;
-        re.find(text).map(|m| m.as_str().trim().to_string())
+        None
     }
 
-    fn extract_appraisal_date(text: &str, _lower: &str) -> Option<String> {
+    fn extract_appraisal_date(text: &str) -> Option<String> {
         let re = Regex::new(
-            r"(?i)(?:laporan terakhir tanggal|latest report dated|date of report)[^\d]{0,20}(?:\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{1,2}/\d{1,2}/\d{4})"
-        ).ok()?;
+            r"(?i)(?:laporan terakhir tanggal|latest report dated|date of report|tanggal laporan|tertanggal)[^\d]{0,30}(\d{1,2}\s+[A-Za-z/]+\s+\d{4})",
+        )
+        .ok()?;
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
-    fn extract_property_location(text: &str, _lower: &str) -> Option<String> {
+    fn extract_property_location(text: &str) -> Option<String> {
         let re = Regex::new(
             r"(?i)(?:properti investasi (?:terutama )?merupakan|investment properties (?:mainly )?represent)[\s\S]{0,500}?\.\s",
         )
@@ -461,7 +516,7 @@ mod pdf_extract {
         }
 
         let re = Regex::new(
-            r"(?i)(?:properti investasi terutama merupakan|investment properties mainly represent)[\s\S]{0,250}(?:terletak di|located in)[\\s\\S]{0,80}?\.\s",
+            r"(?i)(?:properti investasi terutama merupakan|investment properties mainly represent)[\s\S]{0,250}(?:terletak di|located in)[\s\S]{0,80}?\.\s",
         )
         .ok()?;
         if let Some(m) = re.find(text) {
@@ -475,25 +530,24 @@ mod pdf_extract {
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
-    fn extract_accounting_policy(text: &str, _lower: &str) -> Option<String> {
+    fn extract_accounting_policy(text: &str) -> Option<String> {
         let re = Regex::new(
-            r"(?i)(?:properti investasi adalah|investment properties are)[\s\S]{0,800}?(?:penurunan nilai|impairment)"
-        ).ok()?;
+            r"(?i)(?:properti investasi (?:adalah|terdiri dari|diukur|dinyatakan)|investment properties (?:are|consisting of|measured|stated))[\s\S]{0,800}?(?:penurunan nilai|penyusutan|impairment|depreciation)",
+        )
+        .ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
 
         let re = Regex::new(
-            r"(?i)(?:penyusutan dihitung|depreciation is computed)[^.]{0,100}(?:garis lurus|straightline|useful life|masa manfaat)[^.]{0,200}"
-        ).ok()?;
+            r"(?i)(?:penyusutan dihitung|depreciation is computed)[^.]{0,100}(?:garis lurus|straightline|useful life|masa manfaat)[^.]{0,200}",
+        )
+        .ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
 
-        let re = Regex::new(
-            r"(?i)(?:properti investasi|investment propert)[^.]{0,200}(?:penyusutan|depreciation)[^.]{0,300}"
-        ).ok()?;
-        re.find(text).map(|m| m.as_str().trim().to_string())
+        None
     }
 }
 
@@ -509,6 +563,10 @@ mod tests {
         );
         assert_eq!(
             detect_model("measured at cost less accumulated depreciation"),
+            "cost model"
+        );
+        assert_eq!(
+            detect_model("diukur sebesar nilai perolehan setelah dikurangi akumulasi penyusutan"),
             "cost model"
         );
         assert_eq!(detect_model("Idem row 10"), "unknown");
