@@ -1,17 +1,31 @@
 # idxlens-rust
 
-Local Rust port of [IDXLens](https://github.com/lugassawan/idxlens) focused on extracting investment-property data from Indonesian IDX (Bursa Efek Indonesia) XBRL financial reports.
+Local Rust CLI for extracting investment-property disclosure and financial control variables from Indonesian Stock Exchange (IDX / BEI) XBRL instance packages and PDF Annual Reports / CALK.
 
-## What it does
+Built for empirical accounting research on investment property disclosures (PSAK 13 / IAS 40).
 
-Given a local IDX `instance.zip` XBRL archive, this CLI extracts:
+## Capabilities
 
-- `current_year_instant`: current-year carrying value of investment properties.
-- `prior_year_instant`: prior-year carrying value.
-- `policy_text`: the accounting policy narrative from the `InvestmentPropertiesTextBlock` tag.
-- `accounting_model`: whether the issuer uses the **cost model** or **fair value model**.
+Given a local IDX `instance.zip` (and optional Annual Report / CALK PDF):
 
-Output is JSON to stdout or a file.
+1. **Investment Property Facts (XBRL)**:
+   - `current_year_instant`: Carrying value of investment properties (end of current period).
+   - `prior_year_instant`: Prior-year carrying value.
+   - `accounting_model`: Classified as `cost model` or `fair value model` (from XBRL text block or PDF accounting policy fallback).
+   - `policy_text`: Extracted accounting policy narrative (with tag-stripping and fallback handling).
+2. **Control Variables (XBRL)**:
+   - `total_assets` (`Assets`, current instant)
+   - `total_liabilities` (`Liabilities`, current instant)
+   - `equity` (`Equity`, current instant)
+   - `revenues` (`SalesAndRevenue` / `Revenues`, current duration)
+   - `net_income` (`ProfitLoss`, current duration)
+3. **Fair Value & Disclosure Disclosures (PDF / CALK)**:
+   - `pdf_fair_value_amount`: Verbatim sentence disclosing fair value of investment property under cost model.
+   - `pdf_appraiser_name`: Independent appraiser (KJPP) names.
+   - `pdf_appraisal_date`: Valuation report date.
+   - `pdf_property_location_composition`: Property locations and composition.
+
+Output is formatted as structured JSON.
 
 ## Build
 
@@ -19,59 +33,71 @@ Output is JSON to stdout or a file.
 cargo build --release
 ```
 
-The binary will be at `./target/release/idxlens_rust`.
+Binary: `./target/release/idxlens_rust`
 
 ## Usage
 
 ```bash
-idxlens_rust <TICKER> -f <path/to/instance.zip> [-y <year>] [-o output.json]
+idxlens_rust <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pdf>] [-o <output.json>]
 ```
 
-Example:
+### Examples
 
+**1. Full extraction (XBRL + PDF CALK):**
 ```bash
-./target/release/idxlens_rust CTRA -f /path/to/CTRA_2024_instance.zip
+./target/release/idxlens_rust CTRA \
+  -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
+  -y 2023 \
+  --pdf "~/.idxlens/data/CTRA/2023/Audit/PT Ciputra Development Tbk 31 Desember 2023.pdf" \
+  -o /tmp/ctra_2023.json
 ```
 
-Sample output:
+**2. XBRL facts only (fast, no PDF):**
+```bash
+./target/release/idxlens_rust CTRA \
+  -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
+  -y 2023
+```
+
+### Sample Output
 
 ```json
 {
   "ticker": "CTRA",
-  "year": 2024,
-  "current_year_instant": 4996056000000,
-  "prior_year_instant": 5189234000000,
-  "policy_text": "Properti investasi adalah properti ...",
-  "accounting_model": "cost model"
+  "year": 2023,
+  "accounting_model": "cost model",
+  "policy_text": "Properti investasi adalah properti (tanah atau bangunan atau bagian dari suatu bangunan atau kedua-duanya) untuk menghasilkan sewa atau untuk kenaikan nilai atau keduanya. Properti investasi diukur sebesar biaya perolehan setelah dikurangi akumulasi penyusutan dan akumulasi kerugian penurunan nilai",
+  "current_year_instant": 5189234000000,
+  "prior_year_instant": 5349310000000,
+  "total_assets": 44115215000000,
+  "total_liabilities": 21490499000000,
+  "equity": 22624716000000,
+  "revenues": 9245032000000,
+  "net_income": 1909025000000,
+  "pdf_fair_value_amount": "Nilai wajar properti investasi tertentu adalah sebesar Rp13.043.481 yang ditentukan berdasarkan penilaian yang dilakukan oleh penilai independen KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan dan KJPP Susan Widjojo & Rekan, dalam laporan-laporannya dengan laporan terakhir tanggal 28 Maret 2024.",
+  "pdf_appraiser_name": "independent appraisers, KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan and KJPP Susan Widjojo & Rekan, in their reports with the latest report dated March 28, 2024",
+  "pdf_appraisal_date": "laporan terakhir tanggal 28 Maret 2024",
+  "pdf_property_location_composition": "Properti investasi terutama merupakan tanah, bangunan pusat niaga dan kawasan komersial, dan ruang kantor yang terletak di Jakarta, Tangerang, Semarang, dan Surabaya."
 }
 ```
 
-## How it works
+## How It Works
 
-1. **Read the archive**: open the ZIP and locate the `.xbrl` instance file.
-2. **Numeric facts**: use `quick-xml` to stream events and pick up `idx-cor:InvestmentProperties` facts. The `contextRef` attribute tells us whether the value belongs to the current or prior year instant.
-3. **Policy text**: because `quick-xml` skips some text-block tags in large XBRL documents, we fall back to a regex that captures `<idx-cor:InvestmentPropertiesTextBlock ...>...</idx-cor:InvestmentPropertiesTextBlock>`. We try the plural form first, then the singular form.
-4. **Model detection**: the policy text is lower-cased and scanned for Indonesian keywords:
-   - `model nilai wajar` → `fair value model`
-   - `biaya` → `cost model`
-   - otherwise `unknown`
-
-## Why regex fallback?
-
-The original Go `idxlens` and quick streaming parsers can miss the plural `InvestmentPropertiesTextBlock` tag in some IDX XBRL files. The tag is present in the raw XML and visible to Python/lxml, but `quick-xml::Reader` stops emitting the event in the full document. A targeted regex on the predictable tag is the smallest, reliable workaround.
-
-## Limitations
-
-- This tool only accepts **local** XBRL archives. It does not download from IDX/Cloudflare.
-- Detection is based on Indonesian policy text keywords. English or bilingual policies may need keyword expansion.
-- XBRL tag namespace prefix is assumed to be `idx-cor`. A different prefix would require a small regex adjustment.
+1. **XBRL Fact Stream**: Streams XML events via `quick-xml`. Extracts numeric elements (`InvestmentProperties`, `Assets`, `Liabilities`, `Equity`, `SalesAndRevenue`, `ProfitLoss`) matching current-period context references (`CurrentYearInstant`, `CurrentYearDuration`).
+2. **Text Block Extraction & Fallback**:
+   - Matches `<idx-cor:InvestmentPropertiesTextBlock>` via regex fallback (handles quick-xml plural tag stream limitations in large XML instances).
+   - If XBRL text block contains placeholder pointers (e.g. `"Idem row 10"`), falls back automatically to the extracted accounting policy paragraph in the PDF CALK.
+3. **CALK Targeted Scrape**:
+   - Uses `pdf_oxide` to extract text.
+   - Anchors regex extraction to the investment property disclosure note (Note 14 / Note 13) to avoid false positives from Property, Plant & Equipment (PPE) notes.
 
 ## Dependencies
 
-- `quick-xml` — streaming XML parsing.
-- `regex` — robust text-block extraction fallback.
-- `serde_json` — JSON output.
-- `zip` — archive reading.
+- `quick-xml`: Fast streaming XML parser.
+- `pdf_oxide`: Pure Rust PDF text extractor.
+- `regex`: Targeted block and disclosure sentence pattern matching.
+- `serde` / `serde_json`: Serialization.
+- `zip`: In-memory extraction of compressed XBRL instance files.
 
 ## License
 
