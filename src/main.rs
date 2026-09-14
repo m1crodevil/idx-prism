@@ -10,15 +10,29 @@ use std::path::PathBuf;
 use std::process;
 
 #[derive(Debug, Default, Serialize)]
-struct InvestmentPropertyData {
+struct FinancialReportData {
     ticker: String,
     year: u32,
+    accounting_model: String,
+    policy_text: String,
+
+    // Properti Investasi (carrying amounts)
     current_year_instant: Option<i64>,
     prior_year_instant: Option<i64>,
-    policy_text: String,
-    accounting_model: String,
 
-    // PDF-derived fields
+    // Variabel Kontrol Karya Akhir (XBRL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_assets: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_liabilities: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    equity: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revenues: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_income: Option<i64>,
+
+    // Variabel Pengungkapan Nilai Wajar (PDF CALK)
     #[serde(skip_serializing_if = "Option::is_none")]
     pdf_fair_value_amount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,13 +40,18 @@ struct InvestmentPropertyData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pdf_appraisal_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pdf_valuation_method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pdf_valuation_assumptions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pdf_property_location_composition: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pdf_depreciation_policy: Option<String>,
+}
+
+#[derive(Default)]
+struct XbrlNumericFacts {
+    current_year_instant: Option<i64>,
+    prior_year_instant: Option<i64>,
+    total_assets: Option<i64>,
+    total_liabilities: Option<i64>,
+    equity: Option<i64>,
+    revenues: Option<i64>,
+    net_income: Option<i64>,
 }
 
 fn main() {
@@ -46,53 +65,48 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args();
 
     let data = fs::read(&args.file)?;
-    let (current_year_instant, prior_year_instant, mut policy_text) =
-        extract_investment_properties(&data)?;
+    let (facts, mut policy_text) = extract_xbrl_data(&data)?;
     let mut accounting_model = detect_model(&policy_text);
 
     let mut pdf_fair_value_amount = None;
     let mut pdf_appraiser_name = None;
     let mut pdf_appraisal_date = None;
-    let mut pdf_valuation_method = None;
-    let mut pdf_valuation_assumptions = None;
     let mut pdf_property_location_composition = None;
-    let mut pdf_depreciation_policy = None;
 
     if let Some(pdf_path) = &args.pdf {
         let extracted = pdf_extract::extract_pdf_fields(pdf_path)?;
         pdf_fair_value_amount = extracted.fair_value_amount;
         pdf_appraiser_name = extracted.appraiser_name;
         pdf_appraisal_date = extracted.appraisal_date;
-        pdf_valuation_method = extracted.valuation_method;
-        pdf_valuation_assumptions = extracted.valuation_assumptions;
         pdf_property_location_composition = extracted.property_location_composition;
-        pdf_depreciation_policy = extracted.depreciation_policy;
 
-        // Fallback: if XBRL policy text is unusable, derive from PDF accounting policy note.
+        // Fallback: jika policy_text di XBRL hanya pointer generik / kosong
         if policy_text.trim().to_lowercase().starts_with("idem row")
             || policy_text.trim().len() < 20
         {
-            if let Some(ref pdf_policy) = pdf_depreciation_policy {
-                policy_text = pdf_policy.clone();
+            if let Some(pdf_policy) = extracted.accounting_policy {
+                policy_text = pdf_policy;
                 accounting_model = detect_model(&policy_text);
             }
         }
     }
 
-    let result = InvestmentPropertyData {
+    let result = FinancialReportData {
         ticker: args.ticker.to_uppercase(),
         year: args.year,
-        current_year_instant,
-        prior_year_instant,
-        policy_text,
         accounting_model,
+        policy_text,
+        current_year_instant: facts.current_year_instant,
+        prior_year_instant: facts.prior_year_instant,
+        total_assets: facts.total_assets,
+        total_liabilities: facts.total_liabilities,
+        equity: facts.equity,
+        revenues: facts.revenues,
+        net_income: facts.net_income,
         pdf_fair_value_amount,
         pdf_appraiser_name,
         pdf_appraisal_date,
-        pdf_valuation_method,
-        pdf_valuation_assumptions,
         pdf_property_location_composition,
-        pdf_depreciation_policy,
     };
 
     let json = serde_json::to_string_pretty(&result)?;
@@ -116,7 +130,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut ticker = String::new();
-    let mut year = 2024u32;
+    let mut year: Option<u32> = None;
     let mut file = PathBuf::new();
     let mut pdf: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
@@ -126,7 +140,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "-y" | "--year" => {
                 if let Some(v) = iter.next() {
-                    year = v.parse().unwrap_or(2024);
+                    year = v.parse().ok();
                 }
             }
             "-f" | "--file" => {
@@ -149,8 +163,16 @@ fn parse_args() -> Args {
         }
     }
 
+    let year = match year {
+        Some(y) => y,
+        None => {
+            eprintln!("Error: -y / --year is required (e.g. -y 2023)");
+            process::exit(1);
+        }
+    };
+
     if ticker.is_empty() || file.as_os_str().is_empty() {
-        eprintln!("usage: idxlens_rust <ticker> -f <instance.zip> [--pdf <annual_report.pdf>] [-y <year>] [-o <output.json>]");
+        eprintln!("usage: idxlens_rust <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
         process::exit(1);
     }
 
@@ -163,9 +185,7 @@ fn parse_args() -> Args {
     }
 }
 
-fn extract_investment_properties(
-    data: &[u8],
-) -> Result<(Option<i64>, Option<i64>, String), Box<dyn Error>> {
+fn extract_xbrl_data(data: &[u8]) -> Result<(XbrlNumericFacts, String), Box<dyn Error>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))?;
 
     let mut xbrl_bytes = None;
@@ -178,7 +198,9 @@ fn extract_investment_properties(
     }
 
     let xbrl = xbrl_bytes.ok_or("no XBRL file found in archive")?;
-    parse_investment_properties(&xbrl)
+    let facts = parse_numeric_facts(&xbrl)?;
+    let policy = parse_policy_text(&xbrl).unwrap_or_default();
+    Ok((facts, policy))
 }
 
 fn read_zip_entry(mut file: zip::read::ZipFile) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -187,33 +209,50 @@ fn read_zip_entry(mut file: zip::read::ZipFile) -> Result<Vec<u8>, Box<dyn Error
     Ok(buf)
 }
 
-fn parse_investment_properties(
-    xml: &[u8],
-) -> Result<(Option<i64>, Option<i64>, String), Box<dyn Error>> {
-    let (current, prior) = parse_numeric_facts(xml)?;
-    let policy = parse_policy_text(xml).unwrap_or_default();
-    Ok((current, prior, policy))
-}
-
-fn parse_numeric_facts(xml: &[u8]) -> Result<(Option<i64>, Option<i64>), Box<dyn Error>> {
+fn parse_numeric_facts(xml: &[u8]) -> Result<XbrlNumericFacts, Box<dyn Error>> {
     let mut reader = Reader::from_reader(xml);
-
-    let mut current: Option<i64> = None;
-    let mut prior: Option<i64> = None;
+    let mut facts = XbrlNumericFacts::default();
 
     loop {
         match reader.read_event()? {
             Event::Start(e) | Event::Empty(e) => {
                 let local = local_name(&reader, &e)?;
-                if local == "InvestmentProperties" {
-                    if let Some(ctx) = get_attr(&e, b"contextRef") {
-                        let value_text = read_text_content(&mut reader)?;
-                        let value = value_text.replace(',', "").parse::<i64>().ok();
-                        match ctx.as_str() {
-                            "CurrentYearInstant" => current = value,
-                            "PriorEndYearInstant" => prior = value,
-                            _ => {}
+                if let Some(ctx) = get_attr(&e, b"contextRef") {
+                    let is_current_instant =
+                        ctx == "CurrentYearInstant" || ctx == "CurrentPeriodInstant";
+                    let is_current_duration =
+                        ctx == "CurrentYearDuration" || ctx == "CurrentPeriodDuration";
+
+                    match local.as_str() {
+                        "InvestmentProperties" => {
+                            let val = read_text_num(&mut reader)?;
+                            if ctx == "CurrentYearInstant" {
+                                facts.current_year_instant = val;
+                            } else if ctx == "PriorEndYearInstant" {
+                                facts.prior_year_instant = val;
+                            }
                         }
+                        "Assets" if is_current_instant => {
+                            facts.total_assets = read_text_num(&mut reader)?;
+                        }
+                        "Liabilities" if is_current_instant => {
+                            facts.total_liabilities = read_text_num(&mut reader)?;
+                        }
+                        "Equity" if is_current_instant => {
+                            facts.equity = read_text_num(&mut reader)?;
+                        }
+                        "SalesAndRevenue" | "Revenues" if is_current_duration => {
+                            // Ambil hanya jika belum terisi atau konsolidasi agregat
+                            if facts.revenues.is_none() {
+                                facts.revenues = read_text_num(&mut reader)?;
+                            }
+                        }
+                        "ProfitLoss" | "NetIncomeLoss" if is_current_duration => {
+                            if facts.net_income.is_none() {
+                                facts.net_income = read_text_num(&mut reader)?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -222,12 +261,18 @@ fn parse_numeric_facts(xml: &[u8]) -> Result<(Option<i64>, Option<i64>), Box<dyn
         }
     }
 
-    Ok((current, prior))
+    Ok(facts)
+}
+
+fn read_text_num<R: BufRead>(reader: &mut Reader<R>) -> Result<Option<i64>, Box<dyn Error>> {
+    let text = read_text_content(reader)?;
+    Ok(text.replace(',', "").trim().parse::<i64>().ok())
 }
 
 fn parse_policy_text(xml: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(xml);
 
+    // ponytail: fallback regex karena quick-xml miss tag plural idx-cor:InvestmentPropertiesTextBlock
     let plural = Regex::new(
         r"(?s)<([\w-]+:)?InvestmentPropertiesTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertiesTextBlock>"
     ).ok()?;
@@ -297,35 +342,28 @@ fn detect_model(policy: &str) -> String {
 
 mod pdf_extract {
     use regex::Regex;
-    use serde::Serialize;
     use std::error::Error;
     use std::path::Path;
 
-    #[derive(Debug, Default, Serialize)]
+    #[derive(Debug, Default)]
     pub struct PdfExtracted {
         pub fair_value_amount: Option<String>,
         pub appraiser_name: Option<String>,
         pub appraisal_date: Option<String>,
-        pub valuation_method: Option<String>,
-        pub valuation_assumptions: Option<String>,
         pub property_location_composition: Option<String>,
-        pub depreciation_policy: Option<String>,
+        pub accounting_policy: Option<String>,
     }
 
     pub fn extract_pdf_fields<P: AsRef<Path>>(path: P) -> Result<PdfExtracted, Box<dyn Error>> {
         let text = extract_pdf_text(path)?;
         let lower = text.to_lowercase();
 
-        let ip_region = investment_property_region(&text, &lower);
-
         Ok(PdfExtracted {
             fair_value_amount: extract_fair_value_amount(&text, &lower),
             appraiser_name: extract_appraiser_name(&text, &lower),
             appraisal_date: extract_appraisal_date(&text, &lower),
-            valuation_method: extract_valuation_method(&ip_region),
-            valuation_assumptions: extract_valuation_assumptions(&ip_region),
             property_location_composition: extract_property_location(&text, &lower),
-            depreciation_policy: extract_depreciation_policy(&text, &lower),
+            accounting_policy: extract_accounting_policy(&text, &lower),
         })
     }
 
@@ -343,35 +381,11 @@ mod pdf_extract {
         Ok(text)
     }
 
-    /// Return a window of text covering the investment property note, if we can find it.
-    fn investment_property_region<'a>(text: &'a str, lower: &'a str) -> &'a str {
-        let markers = [
-            // Prefer in-note fair value sentence first; it anchors us inside the actual note.
-            "nilai wajar properti investasi",
-            "fair values of certain investment properties",
-            "14. investment properties",
-            "14. properti investasi",
-            "13. investment properties",
-            "13. properti investasi",
-            "investment properties - net",
-            "properti investasi - neto",
-        ];
-        for marker in markers {
-            if let Some(pos) = lower.find(marker) {
-                let end = text.len().min(pos + 8000);
-                return &text[pos..end];
-            }
-        }
-        text
-    }
-
     fn extract_fair_value_amount(text: &str, lower: &str) -> Option<String> {
         if !lower.contains("nilai wajar") && !lower.contains("fair value") {
             return None;
         }
 
-        // Indonesian: capture the sentence containing investment property fair value and the amount.
-        // Stops at the first ". " sentence boundary after the amount.
         let re = Regex::new(
             r"(?i)(nilai wajar properti investasi[\s\S]{0,80}sebesar\s*(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s"
         ).ok()?;
@@ -379,8 +393,9 @@ mod pdf_extract {
             return Some(m.as_str().trim().to_string());
         }
 
-        // English: "fair values of certain investment properties amounted to Rp..."
-        let re = Regex::new(r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\s\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s").ok()?;
+        let re = Regex::new(
+            r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\s\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s"
+        ).ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
@@ -396,7 +411,6 @@ mod pdf_extract {
     }
 
     fn extract_appraiser_name(text: &str, _lower: &str) -> Option<String> {
-        // Capture appraiser list appearing near the investment property fair value sentence.
         let re = Regex::new(
             r"(?i)(?:nilai wajar properti investasi|fair values of certain investment properties)[\s\S]{0,180}((?:penilai independen|independent appraisers)[\s\S]{0,350}?)\.\s"
         ).ok()?;
@@ -418,32 +432,6 @@ mod pdf_extract {
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
-    /// Look for valuation method keywords only within the investment property note region.
-    fn extract_valuation_method(ip_region: &str) -> Option<String> {
-        let lower = ip_region.to_lowercase();
-        if lower.contains("pendekatan pendapatan") || lower.contains("income approach") {
-            return Some("income approach".to_string());
-        }
-        if lower.contains("pendekatan pasar") || lower.contains("market approach") {
-            return Some("market approach".to_string());
-        }
-        if lower.contains("pendekatan biaya") || lower.contains("cost approach") {
-            return Some("cost approach".to_string());
-        }
-        if lower.contains("discounted cash flow") || lower.contains("dcf") {
-            return Some("discounted cash flow".to_string());
-        }
-        None
-    }
-
-    /// Look for valuation assumptions within the investment property note region.
-    fn extract_valuation_assumptions(ip_region: &str) -> Option<String> {
-        let re = Regex::new(
-            r"(?i)(?:highest and best use|penggunaan tertinggi dan terbaik|in estimating the fair value|dalam mengestimasi nilai wajar)[\s\S]{0,250}?\.\s"
-        ).ok()?;
-        re.find(ip_region).map(|m| m.as_str().trim().to_string())
-    }
-
     fn extract_property_location(text: &str, _lower: &str) -> Option<String> {
         let re = Regex::new(
             r"(?i)(?:properti investasi terutama merupakan|investment properties mainly represent)[\s\S]{0,250}(?:terletak di|located in)[\s\S]{0,80}?\.\s"
@@ -458,8 +446,7 @@ mod pdf_extract {
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
-    fn extract_depreciation_policy(text: &str, _lower: &str) -> Option<String> {
-        // Prefer the full investment property accounting policy paragraph.
+    fn extract_accounting_policy(text: &str, _lower: &str) -> Option<String> {
         let re = Regex::new(
             r"(?i)(?:properti investasi adalah|investment properties are)[\s\S]{0,800}?(?:penurunan nilai|impairment)"
         ).ok()?;
@@ -467,7 +454,6 @@ mod pdf_extract {
             return Some(m.as_str().trim().to_string());
         }
 
-        // Fallback to explicit depreciation sentence.
         let re = Regex::new(
             r"(?i)(?:penyusutan dihitung|depreciation is computed)[^.]{0,100}(?:garis lurus|straightline|useful life|masa manfaat)[^.]{0,200}"
         ).ok()?;
