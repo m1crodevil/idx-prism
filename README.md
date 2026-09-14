@@ -37,13 +37,15 @@ Binary: `./target/release/idxlens_rust`
 
 ## Usage
 
+### 1. Extract Financial & Disclosure Data
+
 ```bash
 idxlens_rust <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pdf>] [-o <output.json>]
 ```
 
-### Examples
+**Examples:**
 
-**1. Full extraction (XBRL + PDF CALK):**
+*Full extraction (XBRL + PDF CALK):*
 ```bash
 ./target/release/idxlens_rust CTRA \
   -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
@@ -52,11 +54,42 @@ idxlens_rust <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report
   -o /tmp/ctra_2023.json
 ```
 
-**2. XBRL facts only (fast, no PDF):**
+*XBRL facts only (fast, no PDF):*
 ```bash
 ./target/release/idxlens_rust CTRA \
   -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
   -y 2023
+```
+
+### 2. Sector Filter & Purposive Sampling
+
+Filter sector securities from IDX-IC data for research sampling:
+
+```bash
+idxlens_rust sector [OPTIONS]
+```
+
+**Options:**
+- `-i, --input <FILE>`: Path to securities JSON (defaults to `~/.idxlens/data/idx_properties_securities.json`).
+- `--max-listing-date <YYYY-MM-DD>`: Maximum listing date (e.g. `2021-01-01` for 2021–2023 balanced panel).
+- `--exclude-board <BOARD1,BOARD2>`: Exclude listing boards (e.g. `Akselerasi,Pemantauan Khusus`).
+- `--format <list|csv|json>`: Output format (default: comma-separated `list`).
+- `-o, --output <FILE>`: Save output to file.
+
+**Examples:**
+
+*Generate research sample CSV with purposive sampling report:*
+```bash
+./target/release/idxlens_rust sector \
+  --max-listing-date 2021-01-01 \
+  --exclude-board "Akselerasi,Pemantauan Khusus" \
+  --format csv \
+  -o sample_emiten_properti.csv
+```
+
+*Get ticker list for batch downloader:*
+```bash
+./target/release/idxlens_rust sector --max-listing-date 2021-01-01
 ```
 
 ### Sample Output

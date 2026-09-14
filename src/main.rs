@@ -1,7 +1,7 @@
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -43,15 +43,44 @@ struct FinancialReportData {
     pdf_property_location_composition: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct StockItem {
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "ListingDate")]
+    listing_date: String,
+    #[serde(rename = "Shares", default)]
+    shares: Option<f64>,
+    #[serde(rename = "ListingBoard", default)]
+    listing_board: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StockDataResponse {
+    #[serde(rename = "recordsTotal", default)]
+    records_total: usize,
+    data: Vec<StockItem>,
+}
+
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("Error: {}", e);
-        process::exit(1);
+    let raw_args: Vec<String> = env::args().collect();
+    if raw_args.len() > 1 && raw_args[1] == "sector" {
+        if let Err(e) = run_sector(&raw_args[2..]) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    } else {
+        if let Err(e) = run_extract() {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let args = parse_args();
+fn run_extract() -> Result<(), Box<dyn Error>> {
+    let args = parse_extract_args();
 
     let data = fs::read(&args.file)?;
     let mut report = extract_xbrl_data(&data)?;
@@ -66,8 +95,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         report.pdf_appraisal_date = extracted.appraisal_date;
         report.pdf_property_location_composition = extracted.property_location_composition;
 
-        // Fallback: jika policy_text di XBRL berupa pointer ("Idem row"), kosong,
-        // atau tidak menghasilkan klasifikasi model yang jelas (unknown)
         if report.accounting_model == "unknown"
             || report
                 .policy_text
@@ -105,7 +132,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-struct Args {
+struct ExtractArgs {
     ticker: String,
     year: u32,
     file: PathBuf,
@@ -113,7 +140,7 @@ struct Args {
     output: Option<PathBuf>,
 }
 
-fn parse_args() -> Args {
+fn parse_extract_args() -> ExtractArgs {
     let mut ticker = String::new();
     let mut year: Option<u32> = None;
     let mut file = PathBuf::new();
@@ -161,13 +188,205 @@ fn parse_args() -> Args {
         process::exit(1);
     }
 
-    Args {
+    ExtractArgs {
         ticker,
         year,
         file,
         pdf,
         output,
     }
+}
+
+struct SectorArgs {
+    input: Option<PathBuf>,
+    max_listing_date: Option<String>,
+    exclude_boards: Vec<String>,
+    output: Option<PathBuf>,
+    format: String,
+}
+
+fn parse_sector_args(args: &[String]) -> SectorArgs {
+    let mut input = None;
+    let mut max_listing_date = None;
+    let mut exclude_boards = Vec::new();
+    let mut output = None;
+    let mut format = "list".to_string();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-i" | "--input" => {
+                if let Some(v) = iter.next() {
+                    input = Some(PathBuf::from(v));
+                }
+            }
+            "--max-listing-date" | "--max-date" => {
+                if let Some(v) = iter.next() {
+                    max_listing_date = Some(v.clone());
+                }
+            }
+            "--exclude-board" | "--exclude-boards" => {
+                if let Some(v) = iter.next() {
+                    for b in v.split(',') {
+                        let trimmed = b.trim();
+                        if !trimmed.is_empty() {
+                            exclude_boards.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            "--format" => {
+                if let Some(v) = iter.next() {
+                    format = v.to_lowercase();
+                }
+            }
+            "-o" | "--output" => {
+                if let Some(v) = iter.next() {
+                    output = Some(PathBuf::from(v));
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: idxlens_rust sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
+                process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
+    SectorArgs {
+        input,
+        max_listing_date,
+        exclude_boards,
+        output,
+        format,
+    }
+}
+
+fn run_sector(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
+    let args = parse_sector_args(raw_args);
+
+    let input_path = if let Some(ref p) = args.input {
+        p.clone()
+    } else if let Ok(dir) = env::var("IDXLENS_DATA") {
+        let p = PathBuf::from(dir).join("idx_properties_securities.json");
+        if p.exists() {
+            p
+        } else {
+            resolve_default_securities_path()?
+        }
+    } else {
+        resolve_default_securities_path()?
+    };
+
+    let bytes = fs::read(&input_path).map_err(|e| {
+        format!(
+            "failed to read securities JSON from {}: {}",
+            input_path.display(),
+            e
+        )
+    })?;
+
+    let stock_resp: StockDataResponse = serde_json::from_slice(&bytes)?;
+    let (filtered, excluded_by_date, excluded_by_board) = filter_securities(
+        stock_resp.data,
+        args.max_listing_date.as_deref(),
+        &args.exclude_boards,
+    );
+
+    eprintln!("[Purposive Sampling Report]");
+    eprintln!("- Total Emiten Sektor: {}", stock_resp.records_total);
+    if let Some(ref max_d) = args.max_listing_date {
+        eprintln!(
+            "- Eliminasi Listing IPO setelah {} : -{}",
+            max_d, excluded_by_date
+        );
+    }
+    if !args.exclude_boards.is_empty() {
+        eprintln!(
+            "- Eliminasi Papan {:?} : -{}",
+            args.exclude_boards, excluded_by_board
+        );
+    }
+    eprintln!("- Final Sampel Penelitian: {}", filtered.len());
+
+    let out_str = match args.format.as_str() {
+        "csv" => {
+            let mut s = String::from("Code,Name,ListingDate,ListingBoard\n");
+            for item in &filtered {
+                let date_clean = &item.listing_date[..item.listing_date.len().min(10)];
+                s.push_str(&format!(
+                    "{},\"{}\",{},\"{}\"\n",
+                    item.code,
+                    item.name.replace('"', "\"\""),
+                    date_clean,
+                    item.listing_board.as_deref().unwrap_or("")
+                ));
+            }
+            s
+        }
+        "json" => serde_json::to_string_pretty(&filtered)?,
+        _ => {
+            let codes: Vec<&str> = filtered.iter().map(|x| x.code.as_str()).collect();
+            codes.join(",")
+        }
+    };
+
+    if let Some(ref out_path) = args.output {
+        fs::write(out_path, &out_str)?;
+        eprintln!("Output tersimpan di {}", out_path.display());
+    } else {
+        println!("{}", out_str);
+    }
+
+    Ok(())
+}
+
+fn resolve_default_securities_path() -> Result<PathBuf, Box<dyn Error>> {
+    let home = env::var("HOME").map_err(|_| "HOME environment variable not set")?;
+    let p = PathBuf::from(home).join(".idxlens/data/idx_properties_securities.json");
+    if !p.exists() {
+        return Err(format!(
+            "File data emiten tidak ditemukan di {}. Gunakan -i <path/to/securities.json>.",
+            p.display()
+        )
+        .into());
+    }
+    Ok(p)
+}
+
+fn filter_securities(
+    items: Vec<StockItem>,
+    max_listing_date: Option<&str>,
+    exclude_boards: &[String],
+) -> (Vec<StockItem>, usize, usize) {
+    let mut filtered = Vec::new();
+    let mut excluded_date = 0;
+    let mut excluded_board = 0;
+
+    for item in items {
+        if let Some(max_d) = max_listing_date {
+            let date_prefix = &item.listing_date[..item.listing_date.len().min(10)];
+            if date_prefix > max_d {
+                excluded_date += 1;
+                continue;
+            }
+        }
+
+        if !exclude_boards.is_empty() {
+            let board = item.listing_board.as_deref().unwrap_or("");
+            let matches_exclude = exclude_boards
+                .iter()
+                .any(|ex| ex.eq_ignore_ascii_case(board));
+            if matches_exclude {
+                excluded_board += 1;
+                continue;
+            }
+        }
+
+        filtered.push(item);
+    }
+
+    (filtered, excluded_date, excluded_board)
 }
 
 fn extract_xbrl_data(data: &[u8]) -> Result<FinancialReportData, Box<dyn Error>> {
@@ -422,7 +641,6 @@ mod pdf_extract {
     }
 
     fn extract_appraiser_name(text: &str) -> Option<String> {
-        // Pattern 1: Temukan KJPP langsung dalam region catatan properti investasi
         let re_kjpp = Regex::new(
             r"(?i)(KJPP\s+[A-Za-z0-9\s&,–-]{3,60}?(?:Rekan|\(Rengganis\)|\(Putri\)|dan Rekan|& Rekan))",
         )
@@ -440,7 +658,6 @@ mod pdf_extract {
             return Some(appraisers.join(", "));
         }
 
-        // Pattern 2: Fallback kalimat umum penilai independen
         let re = Regex::new(
             r"(?i)(?:nilai wajar properti investasi|fair values of certain investment properties)[\s\S]{0,180}((?:penilai independen|independent appraisers)[\s\S]{0,350}?)\.\s",
         )
@@ -522,5 +739,40 @@ mod tests {
             clean_policy_text("<p>Biaya <b>perolehan</b></p>"),
             "Biaya perolehan"
         );
+    }
+
+    #[test]
+    fn test_filter_securities() {
+        let items = vec![
+            StockItem {
+                code: "CTRA".into(),
+                name: "Ciputra".into(),
+                listing_date: "1994-03-28T00:00:00".into(),
+                shares: None,
+                listing_board: Some("Utama".into()),
+            },
+            StockItem {
+                code: "TRUE".into(),
+                name: "Triniti".into(),
+                listing_date: "2021-06-10T00:00:00".into(),
+                shares: None,
+                listing_board: Some("Pengembangan".into()),
+            },
+            StockItem {
+                code: "IPAC".into(),
+                name: "Era".into(),
+                listing_date: "2020-01-01T00:00:00".into(),
+                shares: None,
+                listing_board: Some("Akselerasi".into()),
+            },
+        ];
+
+        let (filtered, excl_date, excl_board) =
+            filter_securities(items, Some("2021-01-01"), &["Akselerasi".to_string()]);
+
+        assert_eq!(excl_date, 1); // TRUE listing in June 2021
+        assert_eq!(excl_board, 1); // IPAC in Akselerasi
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].code, "CTRA");
     }
 }
