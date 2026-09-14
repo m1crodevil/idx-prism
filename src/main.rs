@@ -297,13 +297,17 @@ fn parse_policy_text(xml: &[u8]) -> Option<String> {
 }
 
 fn clean_policy_text(raw: &str) -> String {
-    raw.split(|c: char| c == '<' || c == '>')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut in_tag = false;
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn local_name(reader: &Reader<&[u8]>, e: &BytesStart<'_>) -> Result<String, Box<dyn Error>> {
@@ -465,5 +469,27 @@ mod pdf_extract {
             r"(?i)(?:properti investasi|investment propert)[^.]{0,200}(?:penyusutan|depreciation)[^.]{0,300}"
         ).ok()?;
         re.find(text).map(|m| m.as_str().trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_model_and_clean_text() {
+        assert_eq!(
+            detect_model("Perusahaan menggunakan model nilai wajar"),
+            "fair value model"
+        );
+        assert_eq!(
+            detect_model("measured at cost less accumulated depreciation"),
+            "cost model"
+        );
+        assert_eq!(detect_model("Idem row 10"), "unknown");
+        assert_eq!(
+            clean_policy_text("<p>Biaya <b>perolehan</b></p>"),
+            "Biaya perolehan"
+        );
     }
 }
