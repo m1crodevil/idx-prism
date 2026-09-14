@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Batch extractor untuk idxlens_rust ke CSV/JSONL
 OUT_CSV="${1:-/tmp/dataset_properti_2023.csv}"
-DATA_DIR="/home/microdevil/.idxlens/data"
-BINARY="/home/microdevil/idxlens_rust/target/release/idxlens_rust"
+DATA_DIR="${IDXLENS_DATA:-$HOME/.idxlens/data}"
+BINARY="${IDXLENS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/idxlens_rust}"
 
 echo "ticker,year,accounting_model,current_ip,prior_ip,assets,liabilities,equity,revenues,net_income,has_fv_disclosure,appraiser" > "$OUT_CSV"
 
@@ -23,17 +23,20 @@ for ticker_dir in "$DATA_DIR"/*; do
       instance_zip="$audit_dir/instance.zip"
       [ -f "$instance_zip" ] || continue
       
-      # Cari PDF Annual Report atau LK lengkap
+      # Cari PDF Annual Report atau LK lengkap (ambil PDF non-surat/checklist terbesar)
       pdf_file=""
-      # Prioritas nama file lapkeu audit
-      for p in "$audit_dir"/*; do
+      max_size=0
+      for p in "$audit_dir"/*.pdf; do
         [ -f "$p" ] || continue
-        case "$(basename "$p")" in
-          *"BSDE LKT 2023.pdf"*|*"FINAL)"*.pdf|*"LapKeu"*.pdf|*"31 Desember 2023.pdf"*)
-            pdf_file="$p"
-            break
-            ;;
+        fname=$(basename "$p")
+        case "$fname" in
+          *Checklist*|*CheckList*|*CHECKLIST*|*SPD*|*Surat*|*att*|*025.*) continue ;;
         esac
+        size=$(stat -c%s "$p" 2>/dev/null || stat -f%z "$p" 2>/dev/null || wc -c < "$p")
+        if [ "$size" -gt "$max_size" ]; then
+          max_size="$size"
+          pdf_file="$p"
+        fi
       done
 
       cmd=("$BINARY" "$ticker" -f "$instance_zip" -y "$year")
