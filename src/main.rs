@@ -337,7 +337,12 @@ fn detect_model(policy: &str) -> String {
     let lower = policy.to_lowercase();
     if lower.contains("model nilai wajar") || lower.contains("fair value model") {
         "fair value model".to_string()
-    } else if lower.contains("biaya") || lower.contains("cost") {
+    } else if lower.contains("biaya")
+        || lower.contains("cost")
+        || lower.contains("nilai perolehan")
+        || lower.contains("akumulasi penyusutan")
+        || lower.contains("accumulated depreciation")
+    {
         "cost model".to_string()
     } else {
         "unknown".to_string()
@@ -391,15 +396,25 @@ mod pdf_extract {
         }
 
         let re = Regex::new(
-            r"(?i)(nilai wajar properti investasi[\s\S]{0,80}sebesar\s*(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s"
-        ).ok()?;
+            r"(?i)(nilai wajar[\s\S]{0,120}?properti investasi[\s\S]{0,150}?(?:sebesar|amounted to)\s*(?:Rp\.?\s*)?[\d.,]+[\s\S]{0,350}?\.\s)",
+        )
+        .ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
 
         let re = Regex::new(
-            r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\s\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s"
-        ).ok()?;
+            r"(?i)(nilai wajar properti investasi[\s\S]{0,80}sebesar\s*(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s",
+        )
+        .ok()?;
+        if let Some(m) = re.find(text) {
+            return Some(m.as_str().trim().to_string());
+        }
+
+        let re = Regex::new(
+            r"(?i)(fair values of certain investment properties[\s\S]{0,100}(?:amounted to|sebesar)[\s\S]{0,80}(?:Rp\.?\s?)?[\d.,]+[\s\S]{0,300})\.\s",
+        )
+        .ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
@@ -438,15 +453,25 @@ mod pdf_extract {
 
     fn extract_property_location(text: &str, _lower: &str) -> Option<String> {
         let re = Regex::new(
-            r"(?i)(?:properti investasi terutama merupakan|investment properties mainly represent)[\s\S]{0,250}(?:terletak di|located in)[\s\S]{0,80}?\.\s"
-        ).ok()?;
+            r"(?i)(?:properti investasi (?:terutama )?merupakan|investment properties (?:mainly )?represent)[\s\S]{0,500}?\.\s",
+        )
+        .ok()?;
         if let Some(m) = re.find(text) {
             return Some(m.as_str().trim().to_string());
         }
 
         let re = Regex::new(
-            r"(?i)(?:properti investasi|investment properties)[\s\S]{0,200}(?:terletak di|located in)[\s\S]{0,80}?\.\s"
-        ).ok()?;
+            r"(?i)(?:properti investasi terutama merupakan|investment properties mainly represent)[\s\S]{0,250}(?:terletak di|located in)[\\s\\S]{0,80}?\.\s",
+        )
+        .ok()?;
+        if let Some(m) = re.find(text) {
+            return Some(m.as_str().trim().to_string());
+        }
+
+        let re = Regex::new(
+            r"(?i)(?:properti investasi|investment properties)[\s\S]{0,200}(?:terletak di|located in)[\s\S]{0,80}?\.\s",
+        )
+        .ok()?;
         re.find(text).map(|m| m.as_str().trim().to_string())
     }
 
