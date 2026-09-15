@@ -61,9 +61,9 @@ idxlens_rust <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report
   -y 2023
 ```
 
-### 2. Sector Filter & Purposive Sampling
+### 2. Sector Listing & Emiten Details
 
-Filter sector securities from IDX-IC data for research sampling:
+Extract all listed issuers in the sector with metadata (`Code, Name, ListingDate, IPO_Year, ListingBoard, Shares`) for review or manual filtering:
 
 ```bash
 idxlens_rust sector [OPTIONS]
@@ -71,25 +71,47 @@ idxlens_rust sector [OPTIONS]
 
 **Options:**
 - `-i, --input <FILE>`: Path to securities JSON (defaults to `~/.idxlens/data/idx_properties_securities.json`).
-- `--max-listing-date <YYYY-MM-DD>`: Maximum listing date (e.g. `2021-01-01` for 2021–2023 balanced panel).
-- `--exclude-board <BOARD1,BOARD2>`: Exclude listing boards (e.g. `Akselerasi,Pemantauan Khusus`).
-- `--format <list|csv|json>`: Output format (default: comma-separated `list`).
+- `--format <csv|list|json>`: Output format (default: `list`).
 - `-o, --output <FILE>`: Save output to file.
+- `--max-listing-date <YYYY-MM-DD>`: Optional filter by listing date.
+- `--exclude-board <BOARD1,BOARD2>`: Optional board exclusion.
 
 **Examples:**
 
-*Generate research sample CSV with purposive sampling report:*
+*Export all 93 sector issuers with full details to CSV for manual examination:*
 ```bash
-./target/release/idxlens_rust sector \
-  --max-listing-date 2021-01-01 \
-  --exclude-board "Akselerasi,Pemantauan Khusus" \
-  --format csv \
-  -o sample_emiten_properti.csv
+./target/release/idxlens_rust sector --format csv -o emiten_sektor_properti.csv
 ```
 
-*Get ticker list for batch downloader:*
+*Get comma-separated ticker list for batch downloads:*
 ```bash
-./target/release/idxlens_rust sector --max-listing-date 2021-01-01
+./target/release/idxlens_rust sector
+```
+
+### 3. Market Microstructure & Asymmetry Proxies (Tahap D)
+
+Calculate annual information asymmetry proxies and liquidity metrics from daily trading data (Yahoo Finance chart JSON or daily OHLCV CSV):
+
+```bash
+idxlens_rust market -i <path/to/data.json|csv|dir> [OPTIONS]
+```
+
+**Options:**
+- `-i, --input <FILE|DIR>`: Path to daily Yahoo chart JSON, OHLCV CSV, or directory of files (required).
+- `-t, --ticker <TICKER>`: Override ticker symbol (optional).
+- `-y, --year <YEAR>`: Filter by year (optional).
+- `--format <csv|json>`: Output format (default: `csv`).
+- `-o, --output <FILE>`: Save metrics to file (default: stdout).
+
+**Metrics Calculated:**
+1. **Simple Relative Spread**: Mean of daily $\frac{2(\text{High} - \text{Low})}{\text{High} + \text{Low}}$.
+2. **Corwin & Schultz (2012) Spread**: Gold standard 2-day high-low bid-ask spread estimator.
+3. **Amihud (2002) Illiquidity**: Mean of $\frac{|\text{Return}_t|}{\text{Price}_t \times \text{Volume}_t}$.
+4. **Annual Volume**: Total shares traded in the year.
+
+**Example:**
+```bash
+./target/release/idxlens_rust market -i /path/to/PWON.json -o pwon_market_2023.csv
 ```
 
 ### Sample Output

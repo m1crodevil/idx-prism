@@ -6,7 +6,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Debug, Default, Serialize)]
@@ -64,10 +64,35 @@ struct StockDataResponse {
     data: Vec<StockItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MarketMetrics {
+    ticker: String,
+    year: u32,
+    trading_days: usize,
+    simple_spread: f64,
+    corwin_schultz_spread: f64,
+    amihud_illiquidity: f64,
+    annual_volume: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DailyBar {
+    year: u32,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: u64,
+}
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     if raw_args.len() > 1 && raw_args[1] == "sector" {
         if let Err(e) = run_sector(&raw_args[2..]) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    } else if raw_args.len() > 1 && raw_args[1] == "market" {
+        if let Err(e) = run_market(&raw_args[2..]) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -78,6 +103,10 @@ fn main() {
         }
     }
 }
+
+// -------------------------------------------------------------------------
+// Subcommand 1: Financial & CALK Extract
+// -------------------------------------------------------------------------
 
 fn run_extract() -> Result<(), Box<dyn Error>> {
     let args = parse_extract_args();
@@ -197,6 +226,10 @@ fn parse_extract_args() -> ExtractArgs {
     }
 }
 
+// -------------------------------------------------------------------------
+// Subcommand 2: Sector Listing & Details
+// -------------------------------------------------------------------------
+
 struct SectorArgs {
     input: Option<PathBuf>,
     max_listing_date: Option<String>,
@@ -293,33 +326,47 @@ fn run_sector(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
         &args.exclude_boards,
     );
 
-    eprintln!("[Purposive Sampling Report]");
-    eprintln!("- Total Emiten Sektor: {}", stock_resp.records_total);
-    if let Some(ref max_d) = args.max_listing_date {
+    if args.max_listing_date.is_some() || !args.exclude_boards.is_empty() {
+        eprintln!("[Purposive Sampling Report]");
+        eprintln!("- Total Emiten Sektor: {}", stock_resp.records_total);
+        if let Some(ref max_d) = args.max_listing_date {
+            eprintln!(
+                "- Eliminasi Listing IPO setelah {} : -{}",
+                max_d, excluded_by_date
+            );
+        }
+        if !args.exclude_boards.is_empty() {
+            eprintln!(
+                "- Eliminasi Papan {:?} : -{}",
+                args.exclude_boards, excluded_by_board
+            );
+        }
+        eprintln!("- Final Sampel Penelitian: {}", filtered.len());
+    } else {
         eprintln!(
-            "- Eliminasi Listing IPO setelah {} : -{}",
-            max_d, excluded_by_date
+            "[Sektor Properties & Real Estate BEI] Total Emiten: {}",
+            filtered.len()
         );
     }
-    if !args.exclude_boards.is_empty() {
-        eprintln!(
-            "- Eliminasi Papan {:?} : -{}",
-            args.exclude_boards, excluded_by_board
-        );
-    }
-    eprintln!("- Final Sampel Penelitian: {}", filtered.len());
 
     let out_str = match args.format.as_str() {
         "csv" => {
-            let mut s = String::from("Code,Name,ListingDate,ListingBoard\n");
+            let mut s = String::from("Code,Name,ListingDate,IPO_Year,ListingBoard,Shares\n");
             for item in &filtered {
                 let date_clean = &item.listing_date[..item.listing_date.len().min(10)];
+                let ipo_year = if date_clean.len() >= 4 {
+                    &date_clean[..4]
+                } else {
+                    ""
+                };
                 s.push_str(&format!(
-                    "{},\"{}\",{},\"{}\"\n",
+                    "{},\"{}\",{},{},\"{}\",{:.0}\n",
                     item.code,
                     item.name.replace('"', "\"\""),
                     date_clean,
-                    item.listing_board.as_deref().unwrap_or("")
+                    ipo_year,
+                    item.listing_board.as_deref().unwrap_or(""),
+                    item.shares.unwrap_or(0.0)
                 ));
             }
             s
@@ -388,6 +435,438 @@ fn filter_securities(
 
     (filtered, excluded_date, excluded_board)
 }
+
+// -------------------------------------------------------------------------
+// Subcommand 3: Market Data & Asymmetry Proxies (Tahap D)
+// -------------------------------------------------------------------------
+
+struct MarketArgs {
+    input: PathBuf,
+    ticker: Option<String>,
+    year: Option<u32>,
+    format: String,
+    output: Option<PathBuf>,
+}
+
+fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
+    let mut input = None;
+    let mut ticker = None;
+    let mut year = None;
+    let mut format = "csv".to_string();
+    let mut output = None;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-i" | "--input" => {
+                if let Some(v) = iter.next() {
+                    input = Some(PathBuf::from(v));
+                }
+            }
+            "-t" | "--ticker" => {
+                if let Some(v) = iter.next() {
+                    ticker = Some(v.to_uppercase());
+                }
+            }
+            "-y" | "--year" => {
+                if let Some(v) = iter.next() {
+                    year = v.parse::<u32>().ok();
+                }
+            }
+            "--format" => {
+                if let Some(v) = iter.next() {
+                    format = v.to_lowercase();
+                }
+            }
+            "-o" | "--output" => {
+                if let Some(v) = iter.next() {
+                    output = Some(PathBuf::from(v));
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("usage: idxlens_rust market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>]");
+                process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
+    let input = input.ok_or("Error: -i / --input <file|dir> is required")?;
+
+    Ok(MarketArgs {
+        input,
+        ticker,
+        year,
+        format,
+        output,
+    })
+}
+
+fn run_market(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
+    let args = parse_market_args(raw_args)?;
+    let metrics = process_market_path(&args.input, args.ticker.as_deref(), args.year)?;
+
+    if metrics.is_empty() {
+        eprintln!("Warning: No valid daily trading data found in input.");
+    }
+
+    let out_str = match args.format.as_str() {
+        "json" => serde_json::to_string_pretty(&metrics)?,
+        _ => {
+            let mut s = String::from("ticker,year,trading_days,simple_spread,corwin_schultz_spread,amihud_illiquidity,annual_volume\n");
+            for m in &metrics {
+                s.push_str(&format!(
+                    "{},{},{},{:.6},{:.6},{:.6e},{}\n",
+                    m.ticker,
+                    m.year,
+                    m.trading_days,
+                    m.simple_spread,
+                    m.corwin_schultz_spread,
+                    m.amihud_illiquidity,
+                    m.annual_volume
+                ));
+            }
+            s
+        }
+    };
+
+    if let Some(ref out_path) = args.output {
+        fs::write(out_path, &out_str)?;
+        eprintln!("Market metrics saved to {}", out_path.display());
+    } else {
+        print!("{}", out_str);
+    }
+
+    Ok(())
+}
+
+fn process_market_path(
+    path: &Path,
+    filter_ticker: Option<&str>,
+    filter_year: Option<u32>,
+) -> Result<Vec<MarketMetrics>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_file() {
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if ext == "json" || ext == "csv" {
+                    files.push(p);
+                }
+            }
+        }
+    } else {
+        files.push(path.to_path_buf());
+    }
+
+    files.sort();
+    let mut all_metrics = Vec::new();
+
+    for f in files {
+        let (file_ticker, bars) = if f.extension().and_then(|s| s.to_str()) == Some("json") {
+            let bytes = fs::read(&f)?;
+            parse_yahoo_json(&bytes)?
+        } else {
+            let text = fs::read_to_string(&f)?;
+            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("UNKNOWN");
+            parse_daily_csv(&text, stem)?
+        };
+
+        let target_ticker = filter_ticker.unwrap_or(&file_ticker);
+
+        let mut years = std::collections::BTreeSet::new();
+        for b in &bars {
+            if b.year > 0 {
+                years.insert(b.year);
+            }
+        }
+
+        if let Some(y) = filter_year {
+            let year_bars: Vec<DailyBar> = bars
+                .into_iter()
+                .filter(|b| b.year == y || b.year == 0)
+                .collect();
+            if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars) {
+                all_metrics.push(m);
+            }
+        } else if !years.is_empty() {
+            for y in years {
+                let year_bars: Vec<DailyBar> =
+                    bars.iter().filter(|b| b.year == y).cloned().collect();
+                if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars) {
+                    all_metrics.push(m);
+                }
+            }
+        } else {
+            let default_y = 2023;
+            if let Some(m) = compute_market_metrics(target_ticker, default_y, &bars) {
+                all_metrics.push(m);
+            }
+        }
+    }
+
+    Ok(all_metrics)
+}
+
+fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<MarketMetrics> {
+    if bars.is_empty() {
+        return None;
+    }
+
+    let mut simple_spreads = Vec::with_capacity(bars.len());
+    let mut cs_spreads = Vec::with_capacity(bars.len());
+    let mut amihuds = Vec::with_capacity(bars.len());
+    let mut total_vol: u64 = 0;
+
+    let c_const = 3.0 - 2.0 * 2.0_f64.sqrt();
+
+    for i in 0..bars.len() {
+        let b = &bars[i];
+        total_vol += b.volume;
+
+        if b.high > 0.0 && b.low > 0.0 && b.high >= b.low && (b.high + b.low) > 0.0 {
+            let s = 2.0 * (b.high - b.low) / (b.high + b.low);
+            simple_spreads.push(s);
+        }
+
+        if i > 0 {
+            let prev = &bars[i - 1];
+            if prev.close > 0.0 && b.close > 0.0 {
+                let ret = ((b.close - prev.close) / prev.close).abs();
+                let dollar_vol = b.close * (b.volume as f64);
+                if dollar_vol > 0.0 {
+                    amihuds.push(ret / dollar_vol);
+                }
+            }
+
+            // Corwin & Schultz (2012) 2-day high-low bid-ask spread estimator
+            if prev.high > 0.0
+                && prev.low > 0.0
+                && prev.high >= prev.low
+                && b.high > 0.0
+                && b.low > 0.0
+                && b.high >= b.low
+            {
+                let beta = (prev.high / prev.low).ln().powi(2) + (b.high / b.low).ln().powi(2);
+                let h2 = prev.high.max(b.high);
+                let l2 = prev.low.min(b.low);
+                let gamma = (h2 / l2).ln().powi(2);
+
+                let alpha =
+                    ((2.0 * beta).sqrt() - beta.sqrt()) / c_const - (gamma / c_const).sqrt();
+                let cs = if alpha <= 0.0 {
+                    0.0
+                } else {
+                    let exp_a = alpha.exp();
+                    2.0 * (exp_a - 1.0) / (1.0 + exp_a)
+                };
+                cs_spreads.push(cs);
+            }
+        }
+    }
+
+    let trading_days = simple_spreads.len();
+    if trading_days == 0 {
+        return None;
+    }
+
+    let avg_simple = simple_spreads.iter().sum::<f64>() / (trading_days as f64);
+    let avg_cs = if cs_spreads.is_empty() {
+        0.0
+    } else {
+        cs_spreads.iter().sum::<f64>() / (cs_spreads.len() as f64)
+    };
+    let avg_amihud = if amihuds.is_empty() {
+        0.0
+    } else {
+        amihuds.iter().sum::<f64>() / (amihuds.len() as f64)
+    };
+
+    Some(MarketMetrics {
+        ticker: ticker.to_uppercase(),
+        year,
+        trading_days,
+        simple_spread: avg_simple,
+        corwin_schultz_spread: avg_cs,
+        amihud_illiquidity: avg_amihud,
+        annual_volume: total_vol,
+    })
+}
+
+// -------------------------------------------------------------------------
+// Market Data Parsers (Yahoo JSON & Daily CSV)
+// -------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct YahooChartResponse {
+    chart: YahooChart,
+}
+
+#[derive(Deserialize)]
+struct YahooChart {
+    result: Option<Vec<YahooChartResult>>,
+}
+
+#[derive(Deserialize)]
+struct YahooChartResult {
+    meta: Option<YahooMeta>,
+    timestamp: Option<Vec<i64>>,
+    indicators: Option<YahooIndicators>,
+}
+
+#[derive(Deserialize)]
+struct YahooMeta {
+    symbol: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YahooIndicators {
+    quote: Option<Vec<YahooQuote>>,
+}
+
+#[derive(Deserialize)]
+struct YahooQuote {
+    #[serde(default)]
+    high: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    low: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    close: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    volume: Option<Vec<Option<u64>>>,
+}
+
+fn parse_yahoo_json(bytes: &[u8]) -> Result<(String, Vec<DailyBar>), Box<dyn Error>> {
+    let resp: YahooChartResponse = serde_json::from_slice(bytes)?;
+    let result = resp.chart.result.ok_or("no chart result in Yahoo JSON")?;
+    let first = result
+        .into_iter()
+        .next()
+        .ok_or("empty chart result array")?;
+    let symbol = first
+        .meta
+        .and_then(|m| m.symbol)
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let ticker = symbol.split('.').next().unwrap_or(&symbol).to_uppercase();
+
+    let timestamps = first.timestamp.unwrap_or_default();
+    let quote = first
+        .indicators
+        .and_then(|ind| ind.quote)
+        .and_then(|q| q.into_iter().next())
+        .ok_or("no quote indicators in Yahoo JSON")?;
+
+    let highs = quote.high.unwrap_or_default();
+    let lows = quote.low.unwrap_or_default();
+    let closes = quote.close.unwrap_or_default();
+    let volumes = quote.volume.unwrap_or_default();
+
+    let n = timestamps.len();
+    let mut bars = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let ts = timestamps[i];
+        let year = epoch_to_year(ts);
+        let h = highs.get(i).and_then(|&x| x).unwrap_or(0.0);
+        let l = lows.get(i).and_then(|&x| x).unwrap_or(0.0);
+        let c = closes.get(i).and_then(|&x| x).unwrap_or(0.0);
+        let v = volumes.get(i).and_then(|&x| x).unwrap_or(0);
+
+        if h > 0.0 && l > 0.0 && c > 0.0 && h >= l {
+            bars.push(DailyBar {
+                year,
+                high: h,
+                low: l,
+                close: c,
+                volume: v,
+            });
+        }
+    }
+
+    Ok((ticker, bars))
+}
+
+fn parse_daily_csv(
+    content: &str,
+    default_ticker: &str,
+) -> Result<(String, Vec<DailyBar>), Box<dyn Error>> {
+    let mut lines = content.lines();
+    let header = lines.next().ok_or("empty CSV")?;
+    let cols: Vec<String> = header.split(',').map(|s| s.trim().to_lowercase()).collect();
+
+    let idx_date = cols.iter().position(|c| c.contains("date")).unwrap_or(0);
+    let idx_high = cols.iter().position(|c| c == "high").unwrap_or(2);
+    let idx_low = cols.iter().position(|c| c == "low").unwrap_or(3);
+    let idx_close = cols
+        .iter()
+        .position(|c| c == "close" || c == "adj close")
+        .unwrap_or(4);
+    let idx_vol = cols.iter().position(|c| c.contains("vol")).unwrap_or(5);
+
+    let mut bars = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() <= idx_close {
+            continue;
+        }
+        let date_str = parts.get(idx_date).copied().unwrap_or("");
+        let year = if date_str.len() >= 4 {
+            date_str[..4].parse::<u32>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        let h = parts
+            .get(idx_high)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let l = parts
+            .get(idx_low)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let c = parts
+            .get(idx_close)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let v = parts
+            .get(idx_vol)
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|x| x as u64)
+            .unwrap_or(0);
+
+        if h > 0.0 && l > 0.0 && c > 0.0 && h >= l {
+            bars.push(DailyBar {
+                year,
+                high: h,
+                low: l,
+                close: c,
+                volume: v,
+            });
+        }
+    }
+
+    Ok((default_ticker.to_uppercase(), bars))
+}
+
+fn epoch_to_year(ts: i64) -> u32 {
+    let days = ts / 86400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1020 + doe / 1461 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let final_y = if m <= 2 { y + 1 } else { y };
+    final_y as u32
+}
+
+// -------------------------------------------------------------------------
+// Core XBRL & XML Parsers
+// -------------------------------------------------------------------------
 
 fn extract_xbrl_data(data: &[u8]) -> Result<FinancialReportData, Box<dyn Error>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))?;
@@ -770,9 +1249,45 @@ mod tests {
         let (filtered, excl_date, excl_board) =
             filter_securities(items, Some("2021-01-01"), &["Akselerasi".to_string()]);
 
-        assert_eq!(excl_date, 1); // TRUE listing in June 2021
-        assert_eq!(excl_board, 1); // IPAC in Akselerasi
+        assert_eq!(excl_date, 1);
+        assert_eq!(excl_board, 1);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].code, "CTRA");
+    }
+
+    #[test]
+    fn test_market_metrics_calculation() {
+        let bars = vec![
+            DailyBar {
+                year: 2023,
+                high: 100.0,
+                low: 90.0,
+                close: 95.0,
+                volume: 1000,
+            },
+            DailyBar {
+                year: 2023,
+                high: 105.0,
+                low: 95.0,
+                close: 100.0,
+                volume: 2000,
+            },
+            DailyBar {
+                year: 2023,
+                high: 110.0,
+                low: 98.0,
+                close: 105.0,
+                volume: 1500,
+            },
+        ];
+
+        let m = compute_market_metrics("TEST", 2023, &bars).unwrap();
+        assert_eq!(m.ticker, "TEST");
+        assert_eq!(m.year, 2023);
+        assert_eq!(m.trading_days, 3);
+        assert!(m.simple_spread > 0.0);
+        assert!(m.corwin_schultz_spread >= 0.0);
+        assert!(m.amihud_illiquidity > 0.0);
+        assert_eq!(m.annual_volume, 4500);
     }
 }
