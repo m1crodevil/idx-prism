@@ -213,7 +213,7 @@ fn parse_extract_args() -> ExtractArgs {
     };
 
     if ticker.is_empty() || file.as_os_str().is_empty() {
-        eprintln!("usage: idxlens_rust <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
+        eprintln!("usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
         process::exit(1);
     }
 
@@ -279,7 +279,7 @@ fn parse_sector_args(args: &[String]) -> SectorArgs {
                 }
             }
             "-h" | "--help" => {
-                eprintln!("usage: idxlens_rust sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
+                eprintln!("usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
                 process::exit(0);
             }
             _ => {}
@@ -484,7 +484,7 @@ fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
                 }
             }
             "-h" | "--help" => {
-                eprintln!("usage: idxlens_rust market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>]");
+                eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>]");
                 process::exit(0);
             }
             _ => {}

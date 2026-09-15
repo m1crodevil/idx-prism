@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Batch extractor untuk idxlens_rust ke CSV/JSONL
+# Batch extractor untuk idx-prism ke CSV/JSONL
 OUT_CSV="${1:-/tmp/dataset_properti_2023.csv}"
-DATA_DIR="${IDXLENS_DATA:-$HOME/.idxlens/data}"
-BINARY="${IDXLENS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/idxlens_rust}"
+DATA_DIR="${IDXPRISM_DATA:-${IDXLENS_DATA:-$HOME/.idxlens/data}}"
+BINARY="${IDXPRISM_BIN:-${IDXLENS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/idx-prism}}"
 
 echo "ticker,year,accounting_model,current_ip,prior_ip,assets,liabilities,equity,revenues,net_income,has_fv_disclosure,appraiser" > "$OUT_CSV"
 

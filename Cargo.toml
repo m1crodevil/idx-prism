@@ -1,7 +1,9 @@
 [package]
-name = "idxlens_rust"
+name = "idx-prism"
 version = "0.1.0"
 edition = "2021"
+description = "High-performance pipeline for parsing IDX financial disclosures and computing market microstructure metrics"
+license = "MIT"
 
 [dependencies]
 pdf_oxide = "0.3"

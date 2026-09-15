@@ -1,121 +1,70 @@
-# idxlens-rust
+# IDX-Prism
 
-Local Rust CLI for extracting investment-property disclosure and financial control variables from Indonesian Stock Exchange (IDX / BEI) XBRL instance packages and PDF Annual Reports / CALK.
+**IDX-Prism: Automated Financial Disclosure & Market Microstructure Pipeline for Indonesian Capital Market Research**
 
-Built for empirical accounting research on investment property disclosures (PSAK 13 / IAS 40).
+A high-performance Rust toolkit for parsing Indonesia Stock Exchange (IDX / BEI) XBRL financial reports, extracting CALK disclosure notes from Annual Report PDFs, and computing empirical market microstructure / information asymmetry metrics.
 
-## Capabilities
+Built for empirical accounting and financial research (e.g. PSAK 13 / IAS 40 investment property disclosures and information asymmetry studies).
 
-Given a local IDX `instance.zip` (and optional Annual Report / CALK PDF):
+## Core Capabilities
 
-1. **Investment Property Facts (XBRL)**:
-   - `current_year_instant`: Carrying value of investment properties (end of current period).
-   - `prior_year_instant`: Prior-year carrying value.
-   - `accounting_model`: Classified as `cost model` or `fair value model` (from XBRL text block or PDF accounting policy fallback).
-   - `policy_text`: Extracted accounting policy narrative (with tag-stripping and fallback handling).
-2. **Control Variables (XBRL)**:
-   - `total_assets` (`Assets`, current instant)
-   - `total_liabilities` (`Liabilities`, current instant)
-   - `equity` (`Equity`, current instant)
-   - `revenues` (`SalesAndRevenue` / `Revenues`, current duration)
-   - `net_income` (`ProfitLoss`, current duration)
-3. **Fair Value & Disclosure Disclosures (PDF / CALK)**:
-   - `pdf_fair_value_amount`: Verbatim sentence disclosing fair value of investment property under cost model.
-   - `pdf_appraiser_name`: Independent appraiser (KJPP) names.
-   - `pdf_appraisal_date`: Valuation report date.
-   - `pdf_property_location_composition`: Property locations and composition.
+1. **Financial Statements & Controls (`extract`)**:
+   - Streams XBRL instances to extract carrying amounts (`InvestmentProperties`).
+   - Automatically parses financial control variables: `total_assets` (`Assets`), `total_liabilities` (`Liabilities`), `equity` (`Equity`), `revenues` (`SalesAndRevenue`), and `net_income` (`ProfitLoss`).
+   - Classifies accounting model (`cost model` vs `fair value model`).
+   - Extracts verbatim fair value disclosures, independent appraiser (KJPP) names, appraisal dates, and property compositions from PDF Notes to Consolidated Financial Statements (CALK).
+   - Graceful fallback: when XBRL text blocks contain placeholder pointers (`"Idem row 10"`), automatically falls back to the audited PDF CALK accounting policy.
 
-Output is formatted as structured JSON.
+2. **Sector Universe & Sampling (`sector`)**:
+   - Parses official IDX-IC sector listings (e.g. Properties & Real Estate).
+   - Exports complete issuer metadata (`Code`, `Name`, `ListingDate`, `IPO_Year`, `ListingBoard`, `Shares`) to CSV/JSON for manual analysis and purposive sampling.
+   - Built-in purposive filtering options (`--max-listing-date`, `--exclude-board`).
 
-## Build
+3. **Market Microstructure Metrics (`market`)**:
+   - Ingests daily market trading data (Yahoo Finance chart JSON or daily OHLCV CSVs).
+   - Computes annual empirical information asymmetry and liquidity metrics:
+     * **Simple Relative High-Low Spread**
+     * **Corwin & Schultz (2012) Bid-Ask Spread Estimator**
+     * **Amihud (2002) Price Impact / Illiquidity Ratio**
+     * **Annual Trading Volume**
+
+## Installation & Build
+
+Requires Rust toolchain (1.75+):
 
 ```bash
 cargo build --release
 ```
 
-Binary: `./target/release/idxlens_rust`
+The optimized binary will be produced at `./target/release/idx-prism`.
 
-## Usage
+## CLI Usage
 
-### 1. Extract Financial & Disclosure Data
+### 1. Extract Financial & CALK Disclosures
 
 ```bash
-idxlens_rust <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pdf>] [-o <output.json>]
+idx-prism <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pdf>] [-o <output.json>]
 ```
 
 **Examples:**
 
 *Full extraction (XBRL + PDF CALK):*
 ```bash
-./target/release/idxlens_rust CTRA \
+./target/release/idx-prism CTRA \
   -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
   -y 2023 \
   --pdf "~/.idxlens/data/CTRA/2023/Audit/PT Ciputra Development Tbk 31 Desember 2023.pdf" \
   -o /tmp/ctra_2023.json
 ```
 
-*XBRL facts only (fast, no PDF):*
+*XBRL facts only (fast, without PDF):*
 ```bash
-./target/release/idxlens_rust CTRA \
+./target/release/idx-prism CTRA \
   -f ~/.idxlens/data/CTRA/2023/Audit/instance.zip \
   -y 2023
 ```
 
-### 2. Sector Listing & Emiten Details
-
-Extract all listed issuers in the sector with metadata (`Code, Name, ListingDate, IPO_Year, ListingBoard, Shares`) for review or manual filtering:
-
-```bash
-idxlens_rust sector [OPTIONS]
-```
-
-**Options:**
-- `-i, --input <FILE>`: Path to securities JSON (defaults to `~/.idxlens/data/idx_properties_securities.json`).
-- `--format <csv|list|json>`: Output format (default: `list`).
-- `-o, --output <FILE>`: Save output to file.
-- `--max-listing-date <YYYY-MM-DD>`: Optional filter by listing date.
-- `--exclude-board <BOARD1,BOARD2>`: Optional board exclusion.
-
-**Examples:**
-
-*Export all 93 sector issuers with full details to CSV for manual examination:*
-```bash
-./target/release/idxlens_rust sector --format csv -o emiten_sektor_properti.csv
-```
-
-*Get comma-separated ticker list for batch downloads:*
-```bash
-./target/release/idxlens_rust sector
-```
-
-### 3. Market Microstructure & Asymmetry Proxies (Tahap D)
-
-Calculate annual information asymmetry proxies and liquidity metrics from daily trading data (Yahoo Finance chart JSON or daily OHLCV CSV):
-
-```bash
-idxlens_rust market -i <path/to/data.json|csv|dir> [OPTIONS]
-```
-
-**Options:**
-- `-i, --input <FILE|DIR>`: Path to daily Yahoo chart JSON, OHLCV CSV, or directory of files (required).
-- `-t, --ticker <TICKER>`: Override ticker symbol (optional).
-- `-y, --year <YEAR>`: Filter by year (optional).
-- `--format <csv|json>`: Output format (default: `csv`).
-- `-o, --output <FILE>`: Save metrics to file (default: stdout).
-
-**Metrics Calculated:**
-1. **Simple Relative Spread**: Mean of daily $\frac{2(\text{High} - \text{Low})}{\text{High} + \text{Low}}$.
-2. **Corwin & Schultz (2012) Spread**: Gold standard 2-day high-low bid-ask spread estimator.
-3. **Amihud (2002) Illiquidity**: Mean of $\frac{|\text{Return}_t|}{\text{Price}_t \times \text{Volume}_t}$.
-4. **Annual Volume**: Total shares traded in the year.
-
-**Example:**
-```bash
-./target/release/idxlens_rust market -i /path/to/PWON.json -o pwon_market_2023.csv
-```
-
-### Sample Output
-
+**Output Structure:**
 ```json
 {
   "ticker": "CTRA",
@@ -130,29 +79,102 @@ idxlens_rust market -i <path/to/data.json|csv|dir> [OPTIONS]
   "revenues": 9245032000000,
   "net_income": 1909025000000,
   "pdf_fair_value_amount": "Nilai wajar properti investasi tertentu adalah sebesar Rp13.043.481 yang ditentukan berdasarkan penilaian yang dilakukan oleh penilai independen KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan dan KJPP Susan Widjojo & Rekan, dalam laporan-laporannya dengan laporan terakhir tanggal 28 Maret 2024.",
-  "pdf_appraiser_name": "independent appraisers, KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan and KJPP Susan Widjojo & Rekan, in their reports with the latest report dated March 28, 2024",
+  "pdf_appraiser_name": "KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan, KJPP Susan Widjojo & Rekan",
   "pdf_appraisal_date": "laporan terakhir tanggal 28 Maret 2024",
   "pdf_property_location_composition": "Properti investasi terutama merupakan tanah, bangunan pusat niaga dan kawasan komersial, dan ruang kantor yang terletak di Jakarta, Tangerang, Semarang, dan Surabaya."
 }
 ```
 
-## How It Works
+---
 
-1. **XBRL Fact Stream**: Streams XML events via `quick-xml`. Extracts numeric elements (`InvestmentProperties`, `Assets`, `Liabilities`, `Equity`, `SalesAndRevenue`, `ProfitLoss`) matching current-period context references (`CurrentYearInstant`, `CurrentYearDuration`).
-2. **Text Block Extraction & Fallback**:
-   - Matches `<idx-cor:InvestmentPropertiesTextBlock>` via regex fallback (handles quick-xml plural tag stream limitations in large XML instances).
-   - If XBRL text block contains placeholder pointers (e.g. `"Idem row 10"`), falls back automatically to the extracted accounting policy paragraph in the PDF CALK.
-3. **CALK Targeted Scrape**:
-   - Uses `pdf_oxide` to extract text.
-   - Anchors regex extraction to the investment property disclosure note (Note 14 / Note 13) to avoid false positives from Property, Plant & Equipment (PPE) notes.
+### 2. Sector Metadata & Export
+
+Extract sector universe metadata for review or manual filtering:
+
+```bash
+idx-prism sector [OPTIONS]
+```
+
+**Options:**
+- `-i, --input <FILE>`: Path to securities JSON (defaults to `~/.idxlens/data/idx_properties_securities.json`).
+- `--format <csv|list|json>`: Output format (default: `list`).
+- `-o, --output <FILE>`: Save output to file.
+- `--max-listing-date <YYYY-MM-DD>`: Optional listing date threshold.
+- `--exclude-board <BOARD1,BOARD2>`: Optional board exclusion.
+
+**Examples:**
+
+*Export all 93 property sector issuers to CSV with full details:*
+```bash
+./target/release/idx-prism sector --format csv -o emiten_sektor_properti.csv
+```
+
+*Filter sample listing <= 2021-01-01 and exclude boards:*
+```bash
+./target/release/idx-prism sector \
+  --max-listing-date 2021-01-01 \
+  --exclude-board "Akselerasi,Pemantauan Khusus" \
+  --format csv \
+  -o sample_emiten_properti.csv
+```
+
+---
+
+### 3. Market Asymmetry & Liquidity Metrics
+
+Calculate annual information asymmetry proxies and liquidity metrics from daily trading data (Yahoo Finance chart JSON or daily OHLCV CSV):
+
+```bash
+idx-prism market -i <path/to/data.json|csv|dir> [OPTIONS]
+```
+
+**Options:**
+- `-i, --input <FILE|DIR>`: Path to daily Yahoo chart JSON, OHLCV CSV, or directory of files (required).
+- `-t, --ticker <TICKER>`: Override ticker symbol (optional).
+- `-y, --year <YEAR>`: Filter by year (optional).
+- `--format <csv|json>`: Output format (default: `csv`).
+- `-o, --output <FILE>`: Save metrics to file (default: stdout).
+
+**Example:**
+```bash
+./target/release/idx-prism market -i /path/to/PWON.json -o pwon_market_2023.csv
+```
+
+**Output CSV Format:**
+```csv
+ticker,year,trading_days,simple_spread,corwin_schultz_spread,amihud_illiquidity,annual_volume
+PWON,2023,239,0.024608,0.007184,1.045100e-12,7337606000
+```
+
+---
+
+### 4. Batch Automation Pipeline
+
+To extract all downloaded issuer archives to a consolidated CSV dataset:
+
+```bash
+./scripts/batch_extract.sh output_dataset_2023.csv
+```
+
+Configurable via environment variables:
+- `IDXPRISM_DATA`: Path to downloaded IDX data directory (default: `~/.idxlens/data`).
+- `IDXPRISM_BIN`: Path to `idx-prism` executable.
+
+## Technical Architecture
+
+- **XML Streaming**: Zero-allocation byte-slice matching on `quick-xml` reader events for numeric facts.
+- **CALK PDF Engine**: Direct text layer extraction via `pdf_oxide` anchored to specific CALK notes (e.g. Note 14, 13, or 10).
+- **Mathematical Formulations**:
+  - Corwin & Schultz (2012) 2-day high-low bid-ask spread estimator.
+  - Amihud (2002) daily absolute return to dollar volume ratio.
 
 ## Dependencies
 
 - `quick-xml`: Fast streaming XML parser.
 - `pdf_oxide`: Pure Rust PDF text extractor.
-- `regex`: Targeted block and disclosure sentence pattern matching.
-- `serde` / `serde_json`: Serialization.
-- `zip`: In-memory extraction of compressed XBRL instance files.
+- `regex`: Targeted block and disclosure pattern matching.
+- `serde` / `serde_json`: Serialization and deserialization.
+- `zip`: In-memory archive reader.
 
 ## License
 

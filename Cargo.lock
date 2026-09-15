@@ -646,7 +646,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "idxlens_rust"
+name = "idx-prism"
 version = "0.1.0"
 dependencies = [
  "pdf_oxide",
