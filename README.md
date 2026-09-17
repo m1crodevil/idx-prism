@@ -62,7 +62,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 ## Core Capabilities
 
 * **Deterministic XBRL Streaming**: Zero-allocation byte-slice tag matching (`quick-xml`) across massive financial position and profit/loss XBRL instances.
-* **Intelligent Accounting Policy Fallback**: When XBRL disclosure blocks contain placeholder pointers (`"Idem row 10"`), the engine transparently resolves the policy narrative from the audited PDF CALK text layer.
+* **Intelligent Accounting Policy Resolution**: Reads the first non-empty `InvestmentProperty(ies)TextBlock` in document order, so the substantive policy wins over a cross-reference placeholder (some issuers emit only `"Idem row 10"` in one block while the real narrative sits in the other). When every XBRL block is empty or `nil`, it falls back to the policy narrative from the audited PDF CALK text layer.
 * **Standardized Control Variables**: Automatically maps `Assets`, `Liabilities`, `Equity`, `SalesAndRevenue`, and `ProfitLoss` to current-period instants and durations.
 * **Econometric Spread Estimation**: Computes the gold-standard Corwin & Schultz (2012) two-day high-low bid-ask spread estimator, plus Zero-Return-Days and daily-return volatility, to quantify information asymmetry without requiring proprietary intraday tick data.
 * **Share-Ownership Extraction**: Parses the CALK *Modal Saham* note (row-major layout) to recover public/free-float shares, percentage, and shares outstanding — gated by a self-consistency cross-check (`public/total == free-float%`) so mismatched layouts yield `null` instead of a silently wrong number.
@@ -83,6 +83,13 @@ cargo build --release
 ```
 
 The compiled binary will be available at `./target/release/idx-prism`.
+
+### Verify the Build
+```bash
+cargo test                        # unit tests
+./scripts/smoke_test.sh           # end-to-end exercise of every subcommand on local data
+```
+`smoke_test.sh` reads issuer data from `$IDXPRISM_DATA` (default `~/.idxlens/data`) and skips emiten whose files are absent.
 
 ---
 
@@ -111,7 +118,7 @@ idx-prism <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pd
   "ticker": "CTRA",
   "year": 2023,
   "accounting_model": "cost model",
-  "policy_text": "Properti investasi adalah properti (tanah atau bangunan atau bagian dari suatu bangunan atau kedua-duanya) untuk menghasilkan sewa atau untuk kenaikan nilai atau keduanya. Properti investasi diukur sebesar biaya perolehan setelah dikurangi akumulasi penyusutan",
+  "policy_text": "Properti investasi adalah properti (tanah atau bangunan atau bagian dari suatu bangunan atau kedua-duanya) untuk menghasilkan sewa atau untuk kenaikan nilai atau keduanya. Properti investasi diukur sebesar biaya perolehan setelah dikurangi akumulasi penyusutan dan akumulasi kerugian penurunan nilai. …  [truncated — the verbatim XBRL policy block, ~2.2k chars]",
   "current_year_instant": 5189234000000,
   "prior_year_instant": 5349310000000,
   "total_assets": 44115215000000,
