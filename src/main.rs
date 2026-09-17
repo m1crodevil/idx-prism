@@ -41,6 +41,14 @@ struct FinancialReportData {
     pdf_appraisal_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pdf_property_location_composition: Option<String>,
+
+    // Komposisi kepemilikan saham (CALK note Modal Saham)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    free_float_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_shares: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shares_outstanding: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,6 +80,9 @@ struct MarketMetrics {
     simple_spread: f64,
     corwin_schultz_spread: f64,
     amihud_illiquidity: f64,
+    zero_return_days: f64,
+    volatility: f64,
+    turnover: Option<f64>,
     annual_volume: u64,
 }
 
@@ -123,6 +134,12 @@ fn run_extract() -> Result<(), Box<dyn Error>> {
         report.pdf_appraiser_name = extracted.appraiser_name;
         report.pdf_appraisal_date = extracted.appraisal_date;
         report.pdf_property_location_composition = extracted.property_location_composition;
+        report.public_shares = extracted.ownership.public_shares;
+        report.shares_outstanding = extracted.ownership.total_shares;
+        report.free_float_pct = extracted
+            .ownership
+            .free_float_pct
+            .map(|p| (p * 100.0).round() / 100.0);
 
         if report.accounting_model == "unknown"
             || report
@@ -446,6 +463,7 @@ struct MarketArgs {
     year: Option<u32>,
     format: String,
     output: Option<PathBuf>,
+    shares_csv: Option<PathBuf>,
 }
 
 fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
@@ -454,6 +472,7 @@ fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
     let mut year = None;
     let mut format = "csv".to_string();
     let mut output = None;
+    let mut shares_csv = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -483,8 +502,13 @@ fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
                     output = Some(PathBuf::from(v));
                 }
             }
+            "--shares-csv" => {
+                if let Some(v) = iter.next() {
+                    shares_csv = Some(PathBuf::from(v));
+                }
+            }
             "-h" | "--help" => {
-                eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>]");
+                eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]");
                 process::exit(0);
             }
             _ => {}
@@ -499,12 +523,17 @@ fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
         year,
         format,
         output,
+        shares_csv,
     })
 }
 
 fn run_market(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     let args = parse_market_args(raw_args)?;
-    let metrics = process_market_path(&args.input, args.ticker.as_deref(), args.year)?;
+    let shares_map = match &args.shares_csv {
+        Some(p) => load_shares_csv(p)?,
+        None => std::collections::HashMap::new(),
+    };
+    let metrics = process_market_path(&args.input, args.ticker.as_deref(), args.year, &shares_map)?;
 
     if metrics.is_empty() {
         eprintln!("Warning: No valid daily trading data found in input.");
@@ -513,16 +542,19 @@ fn run_market(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     let out_str = match args.format.as_str() {
         "json" => serde_json::to_string_pretty(&metrics)?,
         _ => {
-            let mut s = String::from("ticker,year,trading_days,simple_spread,corwin_schultz_spread,amihud_illiquidity,annual_volume\n");
+            let mut s = String::from("ticker,year,trading_days,simple_spread,corwin_schultz_spread,amihud_illiquidity,zero_return_days,volatility,turnover,annual_volume\n");
             for m in &metrics {
                 s.push_str(&format!(
-                    "{},{},{},{:.6},{:.6},{:.6e},{}\n",
+                    "{},{},{},{:.6},{:.6},{:.6e},{:.6},{:.6},{},{}\n",
                     m.ticker,
                     m.year,
                     m.trading_days,
                     m.simple_spread,
                     m.corwin_schultz_spread,
                     m.amihud_illiquidity,
+                    m.zero_return_days,
+                    m.volatility,
+                    m.turnover.map(|t| format!("{:.6}", t)).unwrap_or_default(),
                     m.annual_volume
                 ));
             }
@@ -540,10 +572,32 @@ fn run_market(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn load_shares_csv(
+    path: &Path,
+) -> Result<std::collections::HashMap<(String, u32), f64>, Box<dyn Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let p: Vec<&str> = line.split(',').map(str::trim).collect();
+        if p.len() < 3 {
+            continue;
+        }
+        // header line skipped naturally: year/shares won't parse
+        let (Ok(year), Ok(shares)) = (p[1].parse::<u32>(), p[2].parse::<f64>()) else {
+            continue;
+        };
+        if shares > 0.0 {
+            map.insert((p[0].to_uppercase(), year), shares);
+        }
+    }
+    Ok(map)
+}
+
 fn process_market_path(
     path: &Path,
     filter_ticker: Option<&str>,
     filter_year: Option<u32>,
+    shares_map: &std::collections::HashMap<(String, u32), f64>,
 ) -> Result<Vec<MarketMetrics>, Box<dyn Error>> {
     let mut files = Vec::new();
     if path.is_dir() {
@@ -575,6 +629,7 @@ fn process_market_path(
         };
 
         let target_ticker = filter_ticker.unwrap_or(&file_ticker);
+        let shares_for = |y: u32| shares_map.get(&(target_ticker.to_uppercase(), y)).copied();
 
         let mut years = std::collections::BTreeSet::new();
         for b in &bars {
@@ -588,29 +643,36 @@ fn process_market_path(
                 .into_iter()
                 .filter(|b| b.year == y || b.year == 0)
                 .collect();
-            if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars) {
+            if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars, shares_for(y)) {
                 all_metrics.push(m);
             }
         } else if !years.is_empty() {
             for y in years {
                 let year_bars: Vec<DailyBar> =
                     bars.iter().filter(|b| b.year == y).cloned().collect();
-                if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars) {
+                if let Some(m) = compute_market_metrics(target_ticker, y, &year_bars, shares_for(y))
+                {
                     all_metrics.push(m);
                 }
             }
         } else {
-            let default_y = 2023;
-            if let Some(m) = compute_market_metrics(target_ticker, default_y, &bars) {
-                all_metrics.push(m);
-            }
+            return Err(format!(
+                "bars in {} have no parseable dates; cannot assign a year",
+                f.display()
+            )
+            .into());
         }
     }
 
     Ok(all_metrics)
 }
 
-fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<MarketMetrics> {
+fn compute_market_metrics(
+    ticker: &str,
+    year: u32,
+    bars: &[DailyBar],
+    shares_outstanding: Option<f64>,
+) -> Option<MarketMetrics> {
     if bars.is_empty() {
         return None;
     }
@@ -618,6 +680,9 @@ fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<
     let mut simple_spreads = Vec::with_capacity(bars.len());
     let mut cs_spreads = Vec::with_capacity(bars.len());
     let mut amihuds = Vec::with_capacity(bars.len());
+    let mut returns = Vec::with_capacity(bars.len());
+    let mut zero_ret_days = 0usize;
+    let mut ret_days = 0usize;
     let mut total_vol: u64 = 0;
 
     let c_const = 3.0 - 2.0 * 2.0_f64.sqrt();
@@ -625,7 +690,6 @@ fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<
     for i in 0..bars.len() {
         let b = &bars[i];
         total_vol += b.volume;
-
         if b.high > 0.0 && b.low > 0.0 && b.high >= b.low && (b.high + b.low) > 0.0 {
             let s = 2.0 * (b.high - b.low) / (b.high + b.low);
             simple_spreads.push(s);
@@ -634,10 +698,15 @@ fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<
         if i > 0 {
             let prev = &bars[i - 1];
             if prev.close > 0.0 && b.close > 0.0 {
-                let ret = ((b.close - prev.close) / prev.close).abs();
-                let dollar_vol = b.close * (b.volume as f64);
-                if dollar_vol > 0.0 {
-                    amihuds.push(ret / dollar_vol);
+                let ret = (b.close - prev.close) / prev.close;
+                returns.push(ret);
+                ret_days += 1;
+                if ret == 0.0 {
+                    zero_ret_days += 1;
+                }
+                if b.volume > 0 {
+                    let dollar_vol = b.close * (b.volume as f64);
+                    amihuds.push(ret.abs() / dollar_vol);
                 }
             }
 
@@ -684,6 +753,29 @@ fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<
         amihuds.iter().sum::<f64>() / (amihuds.len() as f64)
     };
 
+    // ZRD (VG 2019): zero-return days / total return days
+    let zrd = if ret_days > 0 {
+        zero_ret_days as f64 / ret_days as f64
+    } else {
+        0.0
+    };
+
+    // VOLATILITY: sample std dev of daily returns (Ln applied downstream in EViews/Stata)
+    let volatility = if returns.len() > 1 {
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
+        var.sqrt()
+    } else {
+        0.0
+    };
+
+    // TURNOVER (VG 2019): mean daily (shares traded / shares outstanding)
+    let turnover = shares_outstanding.filter(|s| *s > 0.0).map(|so| {
+        let vol_sum: u64 = bars.iter().map(|b| b.volume).sum();
+        (vol_sum as f64 / bars.len() as f64) / so
+    });
+
     Some(MarketMetrics {
         ticker: ticker.to_uppercase(),
         year,
@@ -691,6 +783,9 @@ fn compute_market_metrics(ticker: &str, year: u32, bars: &[DailyBar]) -> Option<
         simple_spread: avg_simple,
         corwin_schultz_spread: avg_cs,
         amihud_illiquidity: avg_amihud,
+        zero_return_days: zrd,
+        volatility,
+        turnover,
         annual_volume: total_vol,
     })
 }
@@ -766,8 +861,7 @@ fn parse_yahoo_json(bytes: &[u8]) -> Result<(String, Vec<DailyBar>), Box<dyn Err
     let n = timestamps.len();
     let mut bars = Vec::with_capacity(n);
 
-    for i in 0..n {
-        let ts = timestamps[i];
+    for (i, &ts) in timestamps.iter().enumerate() {
         let year = epoch_to_year(ts);
         let h = highs.get(i).and_then(|&x| x).unwrap_or(0.0);
         let l = lows.get(i).and_then(|&x| x).unwrap_or(0.0);
@@ -919,15 +1013,15 @@ fn parse_numeric_facts(xml: &[u8], report: &mut FinancialReportData) -> Result<(
                         b"Equity" if is_current_instant => {
                             report.equity = read_text_num(&mut reader)?;
                         }
-                        b"SalesAndRevenue" | b"Revenues" if is_current_duration => {
-                            if report.revenues.is_none() {
-                                report.revenues = read_text_num(&mut reader)?;
-                            }
+                        b"SalesAndRevenue" | b"Revenues"
+                            if is_current_duration && report.revenues.is_none() =>
+                        {
+                            report.revenues = read_text_num(&mut reader)?;
                         }
-                        b"ProfitLoss" | b"NetIncomeLoss" if is_current_duration => {
-                            if report.net_income.is_none() {
-                                report.net_income = read_text_num(&mut reader)?;
-                            }
+                        b"ProfitLoss" | b"NetIncomeLoss"
+                            if is_current_duration && report.net_income.is_none() =>
+                        {
+                            report.net_income = read_text_num(&mut reader)?;
                         }
                         _ => {}
                     }
@@ -1033,6 +1127,14 @@ mod pdf_extract {
         pub appraisal_date: Option<String>,
         pub property_location_composition: Option<String>,
         pub accounting_policy: Option<String>,
+        pub ownership: Ownership,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct Ownership {
+        pub public_shares: Option<i64>,
+        pub total_shares: Option<i64>,
+        pub free_float_pct: Option<f64>,
     }
 
     pub fn extract_pdf_fields<P: AsRef<Path>>(path: P) -> Result<PdfExtracted, Box<dyn Error>> {
@@ -1046,6 +1148,7 @@ mod pdf_extract {
             appraisal_date: extract_appraisal_date(ip_region),
             property_location_composition: extract_property_location(ip_region),
             accounting_policy: extract_accounting_policy(&text),
+            ownership: extract_ownership(&text),
         })
     }
 
@@ -1193,6 +1296,82 @@ mod pdf_extract {
 
         None
     }
+
+    // Komposisi kepemilikan saham (CALK note Modal Saham / Capital Stock).
+    // pdf_oxide mengekstrak tabel ini ROW-MAJOR: satu baris = satu pemegang saham
+    // dengan jumlah saham + persentase inline, mis.:
+    //   "Masyarakat (masing-masing dibawah 5%) 15.070.264.960 31,30 376.756.624 Public ..."
+    //   "Jumlah 48.159.602.400 100,00 1.203.990.060 Total"
+    // Algoritma: anchor ke note "Modal Saham/Capital Stock", cari baris publik
+    // (keyword + jumlah saham dotted + persen koma inline) & baris Jumlah ~100%.
+    // STRICT GATE: emit hanya bila cross-check public/total*100 == free_float (<=0.5pp).
+    // Layout yang pecah (nama & angka terpisah baris, mis. CTRA/SMRA) -> None
+    // (dikoding manual), supaya tidak pernah menghasilkan angka salah senyap.
+    pub(crate) fn extract_ownership(text: &str) -> Ownership {
+        // jumlah saham: integer besar ber-titik; persen: desimal koma (gaya Indonesia)
+        let re_share = Regex::new(r"(\d{1,3}(?:\.\d{3})+)").unwrap();
+        let re_pct = Regex::new(r"(\d{1,3},\d+)\s*%?").unwrap();
+        let re_public = Regex::new(r"(?i)masyarakat|\bpublic\b").unwrap();
+        let re_total = Regex::new(r"(?i)\bjumlah\b|\btotal\b|\bsub-total\b").unwrap();
+
+        let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+        let n = lines.len();
+
+        let first_share = |l: &str| -> Option<i64> {
+            re_share
+                .captures(l)
+                .and_then(|c| c[1].replace('.', "").parse::<i64>().ok())
+                .filter(|v| *v >= 1000)
+        };
+        let first_pct = |l: &str| -> Option<f64> {
+            re_pct
+                .captures(l)
+                .and_then(|c| c[1].replace(',', ".").parse::<f64>().ok())
+        };
+
+        // cari baris publik INLINE pertama (nama + saham + persen dalam satu baris).
+        // scan global (bukan anchor note) — sebutan "capital stock" muncul di narasi
+        // jauh sebelum tabel Modal Saham sebenarnya.
+        let inline_row = |l: &str| -> bool { first_share(l).is_some() && first_pct(l).is_some() };
+
+        let pub_idx = lines
+            .iter()
+            .position(|l| re_public.is_match(l) && inline_row(l));
+        let pub_idx = match pub_idx {
+            Some(i) => i,
+            None => return Ownership::default(),
+        };
+
+        // cari baris Jumlah/Total INLINE terdekat setelahnya (<=40 baris)
+        let total_idx = lines[(pub_idx + 1)..(pub_idx + 41).min(n)]
+            .iter()
+            .position(|l| re_total.is_match(l) && inline_row(l))
+            .map(|k| pub_idx + 1 + k);
+        let total_idx = match total_idx {
+            Some(i) => i,
+            None => return Ownership::default(),
+        };
+
+        let public_shares = first_share(lines[pub_idx]);
+        let free_float = first_pct(lines[pub_idx]);
+        let total_shares = first_share(lines[total_idx]);
+        let total_pct = first_pct(lines[total_idx]);
+
+        let mut own = Ownership::default();
+        if let (Some(ps), Some(ff), Some(ts), Some(tp)) =
+            (public_shares, free_float, total_shares, total_pct)
+        {
+            // total row harus ~100%; cross-check rasio publik == free_float
+            let total_ok = (99.5..=100.05).contains(&tp);
+            let xcheck_ok = ts > 0 && (100.0 * ps as f64 / ts as f64 - ff).abs() <= 0.5;
+            if total_ok && xcheck_ok {
+                own.free_float_pct = Some((ff * 100.0).round() / 100.0);
+                own.public_shares = Some(ps);
+                own.total_shares = Some(ts);
+            }
+        }
+        own
+    }
 }
 
 #[cfg(test)]
@@ -1281,7 +1460,7 @@ mod tests {
             },
         ];
 
-        let m = compute_market_metrics("TEST", 2023, &bars).unwrap();
+        let m = compute_market_metrics("TEST", 2023, &bars, None).unwrap();
         assert_eq!(m.ticker, "TEST");
         assert_eq!(m.year, 2023);
         assert_eq!(m.trading_days, 3);
@@ -1289,5 +1468,91 @@ mod tests {
         assert!(m.corwin_schultz_spread >= 0.0);
         assert!(m.amihud_illiquidity > 0.0);
         assert_eq!(m.annual_volume, 4500);
+        // ZRD: 2 return-day, close 95->100->105 (tak ada yang nol) = 0
+        assert_eq!(m.zero_return_days, 0.0);
+        // volatility sample std dev dari [0.05263, 0.05] > 0
+        assert!(m.volatility > 0.0);
+        // tanpa shares -> turnover None
+        assert!(m.turnover.is_none());
+
+        // dengan shares outstanding -> turnover = mean(volume)/shares
+        let m2 = compute_market_metrics("TEST", 2023, &bars, Some(9000.0)).unwrap();
+        assert!((m2.turnover.unwrap() - (4500.0 / 3.0) / 9000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_zrd_counts_zero_return_days() {
+        // close 100 -> 100 -> 105 : 1 dari 2 return-day = 0.5
+        let bars = vec![
+            DailyBar {
+                year: 2023,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1000,
+            },
+            DailyBar {
+                year: 2023,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1000,
+            },
+            DailyBar {
+                year: 2023,
+                high: 106.0,
+                low: 100.0,
+                close: 105.0,
+                volume: 1000,
+            },
+        ];
+        let m = compute_market_metrics("Z", 2023, &bars, None).unwrap();
+        assert_eq!(m.zero_return_days, 0.5);
+    }
+
+    #[test]
+    fn test_extract_ownership_row_major() {
+        // meniru output pdf_oxide PWON (row-major: nama + saham + persen inline per baris)
+        let txt = "22. MODAL SAHAM 22. CAPITAL STOCK\n\
+Nama Pemegang Saham Shares of Ownership\n\
+PT Pakuwon Arthaniaga 33.077.598.400 68,68 826.939.960 PT Pakuwon Arthaniaga\n\
+Alexander Tedja 10.608.000 0,02 265.200 Alexander Tedja\n\
+Wong Boon Siew Ivy 1.000.000 0,00 25.000 Wong Boon Siew Ivy\n\
+Richard Adisastra 131.040 0,00 3.276 Richard Adisastra\n\
+Masyarakat (masing-masing dibawah 5%) 15.070.264.960 31,30 376.756.624 Public (less than 5% each)\n\
+Jumlah 48.159.602.400 100,00 1.203.990.060 Total\n";
+        let own = super::pdf_extract::extract_ownership(txt);
+        assert_eq!(own.free_float_pct, Some(31.30));
+        assert_eq!(own.public_shares, Some(15_070_264_960));
+        assert_eq!(own.total_shares, Some(48_159_602_400));
+    }
+
+    #[test]
+    fn test_extract_ownership_rejects_split_layout() {
+        // layout "pecah" (CTRA/SMRA: nama & angka di baris terpisah) -> baris publik
+        // TIDAK punya saham+persen inline -> strict gate menolak (None), bukan angka salah.
+        let txt = "MODAL SAHAM\n\
+Masyarakat\n\
+Lain-lain\n\
+8.637.784.479\n\
+46,60%\n\
+Jumlah\n\
+18.535.695.255\n\
+100%\n";
+        let own = super::pdf_extract::extract_ownership(txt);
+        assert_eq!(own.free_float_pct, None);
+        assert_eq!(own.total_shares, None);
+    }
+
+    #[test]
+    fn test_extract_ownership_rejects_bad_xcheck() {
+        // baris publik inline ADA, tapi rasio public/total tidak cocok dgn persen
+        // -> cross-check gagal -> None (bunuh false-positive)
+        let txt = "MODAL SAHAM\n\
+Masyarakat 5.000.000.000 50,00 100.000.000\n\
+Jumlah 48.000.000.000 100,00 900.000.000\n";
+        let own = super::pdf_extract::extract_ownership(txt);
+        // 5e9/48e9 = 10.4% != 50% -> reject
+        assert_eq!(own.free_float_pct, None);
     }
 }

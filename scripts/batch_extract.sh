@@ -6,7 +6,7 @@ OUT_CSV="${1:-/tmp/dataset_properti_2023.csv}"
 DATA_DIR="${IDXPRISM_DATA:-${IDXLENS_DATA:-$HOME/.idxlens/data}}"
 BINARY="${IDXPRISM_BIN:-${IDXLENS_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/idx-prism}}"
 
-echo "ticker,year,accounting_model,current_ip,prior_ip,assets,liabilities,equity,revenues,net_income,has_fv_disclosure,appraiser" > "$OUT_CSV"
+echo "ticker,year,accounting_model,current_ip,prior_ip,assets,liabilities,equity,revenues,net_income,has_fv_disclosure,appraiser,free_float_pct,public_shares,shares_outstanding" > "$OUT_CSV"
 
 for ticker_dir in "$DATA_DIR"/*; do
   [ -d "$ticker_dir" ] || continue
@@ -51,6 +51,9 @@ import sys, json, csv
 
 data = json.loads(sys.argv[1])
 appraiser = data.get("pdf_appraiser_name", "").replace(",", ";")
+def g(k):
+    v = data.get(k)
+    return "" if v is None else v
 row = [
     data.get("ticker", ""),
     data.get("year", ""),
@@ -63,7 +66,10 @@ row = [
     data.get("revenues", ""),
     data.get("net_income", ""),
     "1" if data.get("pdf_fair_value_amount") else "0",
-    appraiser
+    appraiser,
+    g("free_float_pct"),
+    g("public_shares"),
+    g("shares_outstanding")
 ]
 print(",".join(str(x) for x in row))
 ' "$json_out" >> "$OUT_CSV"
