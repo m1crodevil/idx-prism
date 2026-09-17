@@ -2,6 +2,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -96,31 +97,60 @@ struct DailyBar {
 }
 
 fn main() {
-    let raw_args: Vec<String> = env::args().collect();
-    if raw_args.len() > 1 && raw_args[1] == "sector" {
-        if let Err(e) = run_sector(&raw_args[2..]) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    } else if raw_args.len() > 1 && raw_args[1] == "market" {
-        if let Err(e) = run_market(&raw_args[2..]) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    } else {
-        if let Err(e) = run_extract() {
-            eprintln!("Error: {}", e);
-            process::exit(1);
+    let raw: Vec<String> = env::args().collect();
+    let args = &raw[1..];
+
+    let result = match args.first().map(String::as_str) {
+        Some("sector") => run_sector(&args[1..]),
+        Some("market") => run_market(&args[1..]),
+        _ => run_extract(args),
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Shared CLI flag reader
+// -------------------------------------------------------------------------
+
+/// Read `-flag value` pairs. Flags listed in `valued` consume the next arg as
+/// their value; any other `-flag` is recorded bare (presence-only, e.g. `-h`);
+/// everything else is positional, in order. Unknown flags are ignored, matching
+/// the lenient behavior of the original per-subcommand parsers.
+fn parse_flags(args: &[String], valued: &[&str]) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::new();
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        if valued.contains(&arg.as_str()) {
+            if let Some(v) = iter.next() {
+                map.insert(arg.clone(), v.clone());
+            }
+        } else if arg.starts_with('-') {
+            map.insert(arg.clone(), String::new());
+        } else {
+            positional.push(arg.clone());
         }
     }
+
+    (map, positional)
+}
+
+/// First flag present among `names` (alias resolution, first alias wins).
+fn flag<'a>(m: &'a HashMap<String, String>, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|n| m.get(*n)).map(String::as_str)
 }
 
 // -------------------------------------------------------------------------
 // Subcommand 1: Financial & CALK Extract
 // -------------------------------------------------------------------------
 
-fn run_extract() -> Result<(), Box<dyn Error>> {
-    let args = parse_extract_args();
+fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
+    let args = parse_extract_args(raw_args);
 
     let data = fs::read(&args.file)?;
     let mut report = extract_xbrl_data(&data)?;
@@ -134,12 +164,11 @@ fn run_extract() -> Result<(), Box<dyn Error>> {
         report.pdf_appraiser_name = extracted.appraiser_name;
         report.pdf_appraisal_date = extracted.appraisal_date;
         report.pdf_property_location_composition = extracted.property_location_composition;
-        report.public_shares = extracted.ownership.public_shares;
-        report.shares_outstanding = extracted.ownership.total_shares;
-        report.free_float_pct = extracted
-            .ownership
-            .free_float_pct
-            .map(|p| (p * 100.0).round() / 100.0);
+        if let Some((public_shares, total_shares, free_float_pct)) = extracted.ownership {
+            report.public_shares = Some(public_shares);
+            report.shares_outstanding = Some(total_shares);
+            report.free_float_pct = Some((free_float_pct * 100.0).round() / 100.0);
+        }
 
         if report.accounting_model == "unknown"
             || report
@@ -186,50 +215,25 @@ struct ExtractArgs {
     output: Option<PathBuf>,
 }
 
-fn parse_extract_args() -> ExtractArgs {
-    let mut ticker = String::new();
-    let mut year: Option<u32> = None;
-    let mut file = PathBuf::new();
-    let mut pdf: Option<PathBuf> = None;
-    let mut output: Option<PathBuf> = None;
+fn parse_extract_args(raw_args: &[String]) -> ExtractArgs {
+    let (m, positional) = parse_flags(
+        raw_args,
+        &["-y", "--year", "-f", "--file", "--pdf", "-o", "--output"],
+    );
 
-    let mut iter = env::args().skip(1);
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-y" | "--year" => {
-                if let Some(v) = iter.next() {
-                    year = v.parse().ok();
-                }
-            }
-            "-f" | "--file" => {
-                if let Some(v) = iter.next() {
-                    file = PathBuf::from(v);
-                }
-            }
-            "--pdf" => {
-                if let Some(v) = iter.next() {
-                    pdf = Some(PathBuf::from(v));
-                }
-            }
-            "-o" | "--output" => {
-                if let Some(v) = iter.next() {
-                    output = Some(PathBuf::from(v));
-                }
-            }
-            s if s.starts_with('-') => {}
-            s => ticker = s.to_string(),
-        }
-    }
+    let year = flag(&m, &["-y", "--year"]).and_then(|v| v.parse::<u32>().ok());
+    let file = flag(&m, &["-f", "--file"]).map(PathBuf::from);
+    let ticker = positional.last().cloned().unwrap_or_default();
 
-    let year = match year {
-        Some(y) => y,
-        None => {
-            eprintln!("Error: -y / --year is required (e.g. -y 2023)");
-            process::exit(1);
-        }
+    let Some(year) = year else {
+        eprintln!("Error: -y / --year is required (e.g. -y 2023)");
+        process::exit(1);
     };
-
-    if ticker.is_empty() || file.as_os_str().is_empty() {
+    let Some(file) = file.filter(|f| !f.as_os_str().is_empty()) else {
+        eprintln!("usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
+        process::exit(1);
+    };
+    if ticker.is_empty() {
         eprintln!("usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
         process::exit(1);
     }
@@ -238,8 +242,8 @@ fn parse_extract_args() -> ExtractArgs {
         ticker,
         year,
         file,
-        pdf,
-        output,
+        pdf: flag(&m, &["--pdf"]).map(PathBuf::from),
+        output: flag(&m, &["-o", "--output"]).map(PathBuf::from),
     }
 }
 
@@ -256,76 +260,51 @@ struct SectorArgs {
 }
 
 fn parse_sector_args(args: &[String]) -> SectorArgs {
-    let mut input = None;
-    let mut max_listing_date = None;
-    let mut exclude_boards = Vec::new();
-    let mut output = None;
-    let mut format = "list".to_string();
+    let (m, _) = parse_flags(
+        args,
+        &[
+            "-i",
+            "--input",
+            "--max-listing-date",
+            "--max-date",
+            "--exclude-board",
+            "--exclude-boards",
+            "--format",
+            "-o",
+            "--output",
+        ],
+    );
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-i" | "--input" => {
-                if let Some(v) = iter.next() {
-                    input = Some(PathBuf::from(v));
-                }
-            }
-            "--max-listing-date" | "--max-date" => {
-                if let Some(v) = iter.next() {
-                    max_listing_date = Some(v.clone());
-                }
-            }
-            "--exclude-board" | "--exclude-boards" => {
-                if let Some(v) = iter.next() {
-                    for b in v.split(',') {
-                        let trimmed = b.trim();
-                        if !trimmed.is_empty() {
-                            exclude_boards.push(trimmed.to_string());
-                        }
-                    }
-                }
-            }
-            "--format" => {
-                if let Some(v) = iter.next() {
-                    format = v.to_lowercase();
-                }
-            }
-            "-o" | "--output" => {
-                if let Some(v) = iter.next() {
-                    output = Some(PathBuf::from(v));
-                }
-            }
-            "-h" | "--help" => {
-                eprintln!("usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
-                process::exit(0);
-            }
-            _ => {}
-        }
+    if m.contains_key("-h") || m.contains_key("--help") {
+        eprintln!("usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
+        process::exit(0);
     }
 
     SectorArgs {
-        input,
-        max_listing_date,
-        exclude_boards,
-        output,
-        format,
+        input: flag(&m, &["-i", "--input"]).map(PathBuf::from),
+        max_listing_date: flag(&m, &["--max-listing-date", "--max-date"]).map(str::to_string),
+        exclude_boards: flag(&m, &["--exclude-board", "--exclude-boards"])
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        output: flag(&m, &["-o", "--output"]).map(PathBuf::from),
+        format: flag(&m, &["--format"])
+            .map(str::to_lowercase)
+            .unwrap_or_else(|| "list".to_string()),
     }
 }
 
 fn run_sector(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     let args = parse_sector_args(raw_args);
 
-    let input_path = if let Some(ref p) = args.input {
-        p.clone()
-    } else if let Ok(dir) = env::var("IDXLENS_DATA") {
-        let p = PathBuf::from(dir).join("idx_properties_securities.json");
-        if p.exists() {
-            p
-        } else {
-            resolve_default_securities_path()?
-        }
-    } else {
-        resolve_default_securities_path()?
+    let input_path = match args.input {
+        Some(ref p) => p.clone(),
+        None => resolve_default_securities_path()?,
     };
 
     let bytes = fs::read(&input_path).map_err(|e| {
@@ -467,63 +446,40 @@ struct MarketArgs {
 }
 
 fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
-    let mut input = None;
-    let mut ticker = None;
-    let mut year = None;
-    let mut format = "csv".to_string();
-    let mut output = None;
-    let mut shares_csv = None;
+    let (m, _) = parse_flags(
+        args,
+        &[
+            "-i",
+            "--input",
+            "-t",
+            "--ticker",
+            "-y",
+            "--year",
+            "--format",
+            "-o",
+            "--output",
+            "--shares-csv",
+        ],
+    );
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-i" | "--input" => {
-                if let Some(v) = iter.next() {
-                    input = Some(PathBuf::from(v));
-                }
-            }
-            "-t" | "--ticker" => {
-                if let Some(v) = iter.next() {
-                    ticker = Some(v.to_uppercase());
-                }
-            }
-            "-y" | "--year" => {
-                if let Some(v) = iter.next() {
-                    year = v.parse::<u32>().ok();
-                }
-            }
-            "--format" => {
-                if let Some(v) = iter.next() {
-                    format = v.to_lowercase();
-                }
-            }
-            "-o" | "--output" => {
-                if let Some(v) = iter.next() {
-                    output = Some(PathBuf::from(v));
-                }
-            }
-            "--shares-csv" => {
-                if let Some(v) = iter.next() {
-                    shares_csv = Some(PathBuf::from(v));
-                }
-            }
-            "-h" | "--help" => {
-                eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]");
-                process::exit(0);
-            }
-            _ => {}
-        }
+    if m.contains_key("-h") || m.contains_key("--help") {
+        eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]");
+        process::exit(0);
     }
 
-    let input = input.ok_or("Error: -i / --input <file|dir> is required")?;
+    let input = flag(&m, &["-i", "--input"])
+        .map(PathBuf::from)
+        .ok_or("Error: -i / --input <file|dir> is required")?;
 
     Ok(MarketArgs {
         input,
-        ticker,
-        year,
-        format,
-        output,
-        shares_csv,
+        ticker: flag(&m, &["-t", "--ticker"]).map(str::to_uppercase),
+        year: flag(&m, &["-y", "--year"]).and_then(|v| v.parse::<u32>().ok()),
+        format: flag(&m, &["--format"])
+            .map(str::to_lowercase)
+            .unwrap_or_else(|| "csv".to_string()),
+        output: flag(&m, &["-o", "--output"]).map(PathBuf::from),
+        shares_csv: flag(&m, &["--shares-csv"]).map(PathBuf::from),
     })
 }
 
@@ -771,10 +727,9 @@ fn compute_market_metrics(
     };
 
     // TURNOVER (VG 2019): mean daily (shares traded / shares outstanding)
-    let turnover = shares_outstanding.filter(|s| *s > 0.0).map(|so| {
-        let vol_sum: u64 = bars.iter().map(|b| b.volume).sum();
-        (vol_sum as f64 / bars.len() as f64) / so
-    });
+    let turnover = shares_outstanding
+        .filter(|s| *s > 0.0)
+        .map(|so| (total_vol as f64 / bars.len() as f64) / so);
 
     Some(MarketMetrics {
         ticker: ticker.to_uppercase(),
@@ -1043,30 +998,21 @@ fn read_text_num<R: BufRead>(reader: &mut Reader<R>) -> Result<Option<i64>, Box<
 fn parse_policy_text(xml: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(xml);
 
-    // ponytail: fallback regex karena quick-xml miss tag plural idx-cor:InvestmentPropertiesTextBlock
-    let plural = Regex::new(
-        r"(?s)<([\w-]+:)?InvestmentPropertiesTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertiesTextBlock>",
+    // ponytail: regex fallback karena quick-xml miss tag idx-cor:InvestmentPropertiesTextBlock.
+    // Satu alternation menangani tag plural & singular; ambil match pertama yang non-kosong
+    // (sebagian emiten menaruh tag kosong sebelum tag berisi).
+    let re = Regex::new(
+        r"(?s)<(?:[\w-]+:)?InvestmentPropert(?:y|ies)TextBlock[^>]*>(.*?)</(?:[\w-]+:)?InvestmentPropert(?:y|ies)TextBlock>",
     )
     .ok()?;
-    if let Some(m) = plural.captures(&text) {
-        let raw = m.get(2)?.as_str();
-        if !raw.trim().is_empty() {
-            return Some(clean_policy_text(raw));
-        }
-    }
 
-    let singular = Regex::new(
-        r"(?s)<([\w-]+:)?InvestmentPropertyTextBlock[^>]*>(.*?)</([\w-]+:)?InvestmentPropertyTextBlock>",
-    )
-    .ok()?;
-    if let Some(m) = singular.captures(&text) {
-        let raw = m.get(2)?.as_str();
-        if !raw.trim().is_empty() {
-            return Some(clean_policy_text(raw));
-        }
-    }
+    let raw = re
+        .captures_iter(&text)
+        .filter_map(|m| m.get(1))
+        .map(|m| m.as_str())
+        .find(|raw| !raw.trim().is_empty());
 
-    None
+    raw.map(clean_policy_text)
 }
 
 fn clean_policy_text(raw: &str) -> String {
@@ -1127,14 +1073,10 @@ mod pdf_extract {
         pub appraisal_date: Option<String>,
         pub property_location_composition: Option<String>,
         pub accounting_policy: Option<String>,
-        pub ownership: Ownership,
-    }
-
-    #[derive(Debug, Default)]
-    pub struct Ownership {
-        pub public_shares: Option<i64>,
-        pub total_shares: Option<i64>,
-        pub free_float_pct: Option<f64>,
+        /// `(public_shares, total_shares, free_float_pct)` — all-or-nothing: the
+        /// strict cross-check in `extract_ownership` emits nothing unless every
+        /// component was verified, so a partial tuple never occurs.
+        pub ownership: Option<(i64, i64, f64)>,
     }
 
     pub fn extract_pdf_fields<P: AsRef<Path>>(path: P) -> Result<PdfExtracted, Box<dyn Error>> {
@@ -1167,27 +1109,26 @@ mod pdf_extract {
     }
 
     fn investment_property_region<'a>(text: &'a str, lower: &'a str) -> &'a str {
-        let markers = [
+        // Anchor order matters: descriptive phrase, then the numbered CALK note
+        // anchor (note numbers differ per emiten — 10/13/14/16 observed — so match
+        // any number instead of listing them), then the catch-alls.
+        let numbered =
+            Regex::new(r"\d+\.\s*(?:properti investasi|investment propert(?:y|ies))").ok();
+
+        let pos = [
             "nilai wajar properti investasi",
             "fair values of certain investment properties",
-            "16. properti investasi",
-            "16. investment properties",
-            "14. investment properties",
-            "14. properti investasi",
-            "13. investment properties",
-            "13. properti investasi",
-            "10. properti investasi",
-            "10. investment properties",
-            "properti investasi - neto",
-            "properti investasi",
-        ];
-        for marker in markers {
-            if let Some(pos) = lower.find(marker) {
-                let end = text.len().min(pos + 35000);
-                return &text[pos..end];
-            }
+        ]
+        .iter()
+        .find_map(|m| lower.find(m))
+        .or_else(|| numbered.as_ref()?.find(lower).map(|m| m.start()))
+        .or_else(|| lower.find("properti investasi - neto"))
+        .or_else(|| lower.find("properti investasi"));
+
+        match pos {
+            Some(p) => &text[p..text.len().min(p + 35000)],
+            None => text,
         }
-        text
     }
 
     fn extract_fair_value_amount(text: &str) -> Option<String> {
@@ -1212,14 +1153,19 @@ mod pdf_extract {
             return Some(m.as_str().trim().to_string());
         }
 
-        let re = Regex::new(r"(?i)nilai wajar properti investasi[^.]{0,150}").ok()?;
-        if let Some(m) = re.find(text) {
-            return Some(m.as_str().trim().to_string());
+        // fallback longgar: fragmen setelah frasa. Urutan pola penting (ID dulu, lalu EN) —
+        // jangan digabung jadi satu alternation, karena alternation menang berdasarkan
+        // posisi di teks, bukan prioritas pola.
+        for pat in [
+            r"(?i)nilai wajar properti investasi[^.]{0,150}",
+            r"(?i)fair value of (?:the )?investment propert(?:y|ies)[^.,]{0,150}",
+        ] {
+            if let Some(m) = Regex::new(pat).ok()?.find(text) {
+                return Some(m.as_str().trim().to_string());
+            }
         }
 
-        let re = Regex::new(r"(?i)fair value of (?:the )?investment propert(?:y|ies)[^.,]{0,150}")
-            .ok()?;
-        re.find(text).map(|m| m.as_str().trim().to_string())
+        None
     }
 
     fn extract_appraiser_name(text: &str) -> Option<String> {
@@ -1307,7 +1253,7 @@ mod pdf_extract {
     // STRICT GATE: emit hanya bila cross-check public/total*100 == free_float (<=0.5pp).
     // Layout yang pecah (nama & angka terpisah baris, mis. CTRA/SMRA) -> None
     // (dikoding manual), supaya tidak pernah menghasilkan angka salah senyap.
-    pub(crate) fn extract_ownership(text: &str) -> Ownership {
+    pub(crate) fn extract_ownership(text: &str) -> Option<(i64, i64, f64)> {
         // jumlah saham: integer besar ber-titik; persen: desimal koma (gaya Indonesia)
         let re_share = Regex::new(r"(\d{1,3}(?:\.\d{3})+)").unwrap();
         let re_pct = Regex::new(r"(\d{1,3},\d+)\s*%?").unwrap();
@@ -1336,41 +1282,25 @@ mod pdf_extract {
 
         let pub_idx = lines
             .iter()
-            .position(|l| re_public.is_match(l) && inline_row(l));
-        let pub_idx = match pub_idx {
-            Some(i) => i,
-            None => return Ownership::default(),
-        };
+            .position(|l| re_public.is_match(l) && inline_row(l))?;
 
         // cari baris Jumlah/Total INLINE terdekat setelahnya (<=40 baris)
         let total_idx = lines[(pub_idx + 1)..(pub_idx + 41).min(n)]
             .iter()
             .position(|l| re_total.is_match(l) && inline_row(l))
-            .map(|k| pub_idx + 1 + k);
-        let total_idx = match total_idx {
-            Some(i) => i,
-            None => return Ownership::default(),
-        };
+            .map(|k| pub_idx + 1 + k)?;
 
-        let public_shares = first_share(lines[pub_idx]);
-        let free_float = first_pct(lines[pub_idx]);
-        let total_shares = first_share(lines[total_idx]);
-        let total_pct = first_pct(lines[total_idx]);
+        let public_shares = first_share(lines[pub_idx])?;
+        let free_float = first_pct(lines[pub_idx])?;
+        let total_shares = first_share(lines[total_idx])?;
+        let total_pct = first_pct(lines[total_idx])?;
 
-        let mut own = Ownership::default();
-        if let (Some(ps), Some(ff), Some(ts), Some(tp)) =
-            (public_shares, free_float, total_shares, total_pct)
-        {
-            // total row harus ~100%; cross-check rasio publik == free_float
-            let total_ok = (99.5..=100.05).contains(&tp);
-            let xcheck_ok = ts > 0 && (100.0 * ps as f64 / ts as f64 - ff).abs() <= 0.5;
-            if total_ok && xcheck_ok {
-                own.free_float_pct = Some((ff * 100.0).round() / 100.0);
-                own.public_shares = Some(ps);
-                own.total_shares = Some(ts);
-            }
-        }
-        own
+        // total row harus ~100%; cross-check rasio publik == free_float
+        let total_ok = (99.5..=100.05).contains(&total_pct);
+        let xcheck_ok = total_shares > 0
+            && (100.0 * public_shares as f64 / total_shares as f64 - free_float).abs() <= 0.5;
+
+        (total_ok && xcheck_ok).then_some((public_shares, total_shares, free_float))
     }
 }
 
@@ -1511,6 +1441,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_policy_text_skips_idem_reference() {
+        // CTRA 2023: tag singular berisi kebijakan riil, tag plural hanya penunjuk
+        // "Idem row 10". Ambil yang riil (urutan dokumen), bukan penunjuknya —
+        // kalau tidak, extractor jatuh ke teks PDF yang belum dinormalisasi.
+        let xml = br#"<idx-cor:InvestmentPropertyTextBlock ctx="a">Properti investasi diukur dengan model biaya</idx-cor:InvestmentPropertyTextBlock><idx-cor:InvestmentPropertiesTextBlock ctx="b">Idem row 10</idx-cor:InvestmentPropertiesTextBlock>"#;
+        assert_eq!(
+            parse_policy_text(xml).as_deref(),
+            Some("Properti investasi diukur dengan model biaya")
+        );
+    }
+
+    #[test]
     fn test_extract_ownership_row_major() {
         // meniru output pdf_oxide PWON (row-major: nama + saham + persen inline per baris)
         let txt = "22. MODAL SAHAM 22. CAPITAL STOCK\n\
@@ -1522,9 +1464,11 @@ Richard Adisastra 131.040 0,00 3.276 Richard Adisastra\n\
 Masyarakat (masing-masing dibawah 5%) 15.070.264.960 31,30 376.756.624 Public (less than 5% each)\n\
 Jumlah 48.159.602.400 100,00 1.203.990.060 Total\n";
         let own = super::pdf_extract::extract_ownership(txt);
-        assert_eq!(own.free_float_pct, Some(31.30));
-        assert_eq!(own.public_shares, Some(15_070_264_960));
-        assert_eq!(own.total_shares, Some(48_159_602_400));
+        let (public_shares, total_shares, free_float_pct) =
+            own.expect("row-major layout must parse");
+        assert_eq!(free_float_pct, 31.30);
+        assert_eq!(public_shares, 15_070_264_960);
+        assert_eq!(total_shares, 48_159_602_400);
     }
 
     #[test]
@@ -1539,9 +1483,7 @@ Lain-lain\n\
 Jumlah\n\
 18.535.695.255\n\
 100%\n";
-        let own = super::pdf_extract::extract_ownership(txt);
-        assert_eq!(own.free_float_pct, None);
-        assert_eq!(own.total_shares, None);
+        assert_eq!(super::pdf_extract::extract_ownership(txt), None);
     }
 
     #[test]
@@ -1551,8 +1493,7 @@ Jumlah\n\
         let txt = "MODAL SAHAM\n\
 Masyarakat 5.000.000.000 50,00 100.000.000\n\
 Jumlah 48.000.000.000 100,00 900.000.000\n";
-        let own = super::pdf_extract::extract_ownership(txt);
         // 5e9/48e9 = 10.4% != 50% -> reject
-        assert_eq!(own.free_float_pct, None);
+        assert_eq!(super::pdf_extract::extract_ownership(txt), None);
     }
 }
