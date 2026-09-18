@@ -1045,20 +1045,150 @@ fn read_text_content<R: BufRead>(reader: &mut Reader<R>) -> Result<String, Box<d
     }
 }
 
+/// Klasifikasi model pengukuran properti investasi (PSAK 240).
+///
+/// Akar masalah versi lama: mencocokkan KATA KUNCI ("biaya"/"cost") alih-alih
+/// KALIMAT PENGUKURAN. Setiap emiten model nilai wajar menulis "biaya perolehan
+/// pada saat pengakuan awal" (biaya perolehan awal ≠ model biaya), sehingga
+/// MMLP/KBAG/BSBK — yang jelas fair value — terklasifikasi `cost model`.
+/// Arah salah ini berbahaya: emiten FV akan masuk sampel cost-model (kriteria 3).
+///
+/// Karena itu: cari kalimat pengukuran SETELAH pengakuan awal; di situ modelnya
+/// dinyatakan. Kalau tidak ada penanda itu, baru pakai indikator seluruh teks —
+/// dan indikator biaya harus POSITIF (penyusutan/akumulasi/model biaya), bukan
+/// sekadar kata "biaya".
 fn detect_model(policy: &str) -> String {
-    let lower = policy.to_lowercase();
-    if lower.contains("model nilai wajar") || lower.contains("fair value model") {
-        "fair value model".to_string()
-    } else if lower.contains("biaya")
-        || lower.contains("cost")
-        || lower.contains("nilai perolehan")
-        || lower.contains("akumulasi penyusutan")
-        || lower.contains("accumulated depreciation")
-    {
-        "cost model".to_string()
-    } else {
-        "unknown".to_string()
+    let raw = policy.to_lowercase();
+    // Negasi: "tidak disusutkan" / "not depreciated" adalah penanda MODEL NILAI
+    // WAJAR (FV tidak disusutkan), bukan penanda biaya. Tanpa ini, PLIN
+    // (yang menyatakan "menggunakan model nilai wajar") terbaca `cost model`.
+    let mut lower = raw.clone();
+    for neg in [
+        "tidak disusutkan",
+        "tidak diamortisasi",
+        "tidak mengalami penyusutan",
+        "not depreciated",
+        "not amortised",
+        "not amortized",
+        "no depreciation",
+    ] {
+        lower = lower.replace(neg, " ");
     }
+
+    // Indikator kuat, dipakai baik di jendela maupun seluruh teks.
+    let cost_strong = [
+        "model biaya",
+        "cost model",
+        "akumulasi penyusutan",
+        "accumulated depreciation",
+        "disusutkan",
+        "depreciated",
+        "garis lurus",
+        "straight-line",
+        "straight line",
+        "umur manfaat",
+        "useful life",
+    ];
+    // "model revaluasi" = keluarga nilai wajar, tapi bukan fair value model murni
+    // (dipakai KBAG/BSBK sebelum beralih). Dibedakan agar tabel seleksi jujur.
+    let reval = ["model revaluasi", "revaluation model"];
+    let fv = [
+        "model nilai wajar",
+        "fair value model",
+        "nilai wajarnya",
+        "nilai wajar",
+        "fair value",
+    ];
+    let has = |w: &str, pats: &[&str]| pats.iter().any(|p| w.contains(p));
+
+    // Kalimat kebijakan yang MENENTUKAN model saat ini. Emiten yang beralih model
+    // menyebut keduanya secara kronologis (EMDE: "sebelum 1 Jan 2021 … model
+    // biaya … mulai 1 Jan 2021 … model nilai wajar"), jadi yang dipakai adalah
+    // kemunculan TERAKHIR — kebijakan terbaru ditulis belakangan.
+    // ponytail: bergantung urutan kronologis dalam catatan. Kalau ada emiten yang
+    // menulis kebijakan terkini lebih dulu, cross-check PDF/vision (Fase 4).
+    let mut governing: Option<(usize, &str)> = None;
+    for a in [
+        "menggunakan model nilai wajar",
+        "uses the fair value model",
+        "menggunakan model biaya",
+        "uses the cost model",
+    ] {
+        if let Some(i) = lower.rfind(a) {
+            let is_fv = a.contains("nilai wajar") || a.contains("fair value");
+            if governing.is_none_or(|(pos, _)| i > pos) {
+                governing = Some((i, if is_fv { "fv" } else { "cost" }));
+            }
+        }
+    }
+    if let Some((_, kind)) = governing {
+        return if kind == "cost" {
+            "cost model".to_string()
+        } else {
+            "fair value model".to_string()
+        };
+    }
+
+    // Jendela ~260 char setelah penanda pengukuran lanjutan: di situlah model
+    // dinyatakan ("setelah pengakuan awal, ... dicatat pada nilai wajar" /
+    // "... berdasarkan model biaya ... disusutkan").
+    let anchors = [
+        "setelah pengakuan awal",
+        "subsequent to initial recognition",
+        "subsequently measured",
+        "selanjutnya diukur",
+        "diukur selanjutnya",
+        "dicatat menggunakan model",
+    ];
+    let mut window = String::new();
+    for a in anchors {
+        if let Some(i) = lower.find(a) {
+            let end = (i + a.len() + 260).min(lower.len());
+            window.push_str(&lower[i..end]);
+            window.push(' ');
+        }
+    }
+
+    if !window.is_empty() {
+        // Biaya diperiksa LEBIH DULU: ARGO menyebut "diukur selanjutnya pada
+        // nilai wajar" di blok definisi, tapi kalimat pengukurannya model biaya.
+        if has(&window, &cost_strong) {
+            return "cost model".to_string();
+        }
+        if has(&window, &reval) {
+            return "revaluation model".to_string();
+        }
+        if has(&window, &fv) {
+            return "fair value model".to_string();
+        }
+    }
+
+    // Tanpa penanda pengukuran lanjutan: indikator kuat di seluruh teks.
+    if has(&lower, &cost_strong) {
+        return "cost model".to_string();
+    }
+    if has(&lower, &reval) {
+        return "revaluation model".to_string();
+    }
+    // Frasa FV harus berupa pengukuran, bukan sekadar penyebutan; "nilai wajar"
+    // sendirian terlalu longgar (definisi & kombinasi bisnis memuatnya), jadi
+    // hanya frasa pengukuran eksplisit yang diterima.
+    let fv_measure = [
+        "diukur dengan menggunakan nilai wajar",
+        "diukur pada nilai wajar",
+        "diukur sebesar nilai wajar",
+        "dicatat pada nilai wajar",
+        "dicatat sebesar nilai wajar",
+        "dinilai sebesar nilai wajar",
+        "dinyatakan berdasarkan nilai wajar",
+        "measured at fair value",
+        "model nilai wajar",
+        "fair value model",
+    ];
+    if has(&lower, &fv_measure) {
+        return "fair value model".to_string();
+    }
+    "unknown".to_string()
 }
 
 mod pdf_extract {
@@ -1607,6 +1737,69 @@ Jumlah 18.535.695.255 100% 4.633.924 Total\n";
         assert_eq!(ff, 46.60);
         assert_eq!(ps, 8_637_784_479);
         assert_eq!(ts, 18_535_695_255);
+    }
+
+    #[test]
+    fn test_detect_model_transition_uses_current_policy() {
+        // EMDE: menyebut kebijakan LAMA lalu BARU secara kronologis. Yang berlaku
+        // adalah yang terakhir (model nilai wajar), bukan "model biaya" historis.
+        let t =
+            "Sebelum tanggal 1 Januari 2021, properti investasi diukur menggunakan model biaya \
+                 untuk pengukuran setelah pengakuan. Berdasarkan model biaya, properti investasi \
+                 diukur sebesar nilai perolehan setelah dikurangi akumulasi penyusutan. \
+                 Mulai tanggal 1 Januari 2021, Grup menggunakan model nilai wajar untuk pengukuran \
+                 setelah pengakuan.";
+        assert_eq!(detect_model(t), "fair value model");
+    }
+
+    #[test]
+    fn test_detect_model_negated_depreciation_is_fair_value() {
+        // PLIN: satu-satunya token mirip-biaya adalah "tidak disusutkan" — dan itu
+        // justru penanda FV (properti FV tidak disusutkan), bukan penanda biaya.
+        let t = "Properti investasi yang penyelesaian masa depannya belum ditentukan \
+                 diklasifikasikan sebagai properti investasi dan tidak disusutkan. \
+                 Perseroan menggunakan model nilai wajar untuk pengukuran setelah pengakuan.";
+        assert_eq!(detect_model(t), "fair value model");
+    }
+
+    #[test]
+    fn test_detect_model_initial_cost_is_not_cost_model() {
+        // MMLP: "biaya perolehan" hanya pada PENGAKUAN AWAL; pengukuran lanjutannya
+        // nilai wajar. Versi lama membaca kata "biaya" lalu menyimpulkan cost model —
+        // arah salah yang berbahaya (emiten FV masuk sampel cost-model, kriteria 3).
+        let t = "Properti investasi pada awalnya diukur sebesar biaya perolehan, termasuk biaya \
+                 transaksi dan selanjutnya diukur pada nilai wajarnya.";
+        assert_eq!(detect_model(t), "fair value model");
+    }
+
+    #[test]
+    fn test_detect_model_revaluation_category() {
+        // KBAG: kategori ketiga (model revaluasi) — bukan cost, bukan FV murni.
+        // Dibedakan supaya tabel seleksi jujur; kriteria 3 tetap mengecualikannya.
+        let t = "Properti investasi dicatat menggunakan model revaluasi yaitu nilai wajar pada \
+                 tanggal revaluasi.";
+        assert_eq!(detect_model(t), "revaluation model");
+    }
+
+    #[test]
+    fn test_detect_model_cost_wins_over_fv_in_definition() {
+        // ARGO: blok definisi menyebut "diukur selanjutnya pada nilai wajar", TAPI
+        // kalimat pengukuran kebijakannya model biaya + disusutkan. Karena itu
+        // biaya diperiksa lebih dulu di dalam jendela pengukuran.
+        let t = "Properti investasi diukur pada harga perolehan pada saat pengakuan awal dan \
+                 diukur selanjutnya pada nilai wajar dengan segala perubahannya di dalam laba rugi. \
+                 Pengakuan awal properti investasi sebesar biaya perolehan, setelah pengakuan awal \
+                 dinyatakan berdasarkan model biaya yang dicatat sebesar biaya perolehan dikurangi \
+                 akumulasi penyusutan. Bangunan disusutkan dengan metode garis lurus.";
+        assert_eq!(detect_model(t), "cost model");
+    }
+
+    #[test]
+    fn test_detect_model_fv_measurement_without_anchor() {
+        // BBSS/TRIN: menyatakan FV tanpa penanda "setelah pengakuan awal".
+        let t = "Properti investasi adalah properti untuk menghasilkan pendapatan sewa atau untuk \
+                 kenaikan nilai atau keduanya. Properti investasi diukur dengan menggunakan nilai wajar.";
+        assert_eq!(detect_model(t), "fair value model");
     }
 
     #[test]
