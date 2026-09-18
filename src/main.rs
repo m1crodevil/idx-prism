@@ -1094,14 +1094,57 @@ mod pdf_extract {
         })
     }
 
+    /// Below this, `extract_words` already merges runs that share a baseline;
+    /// this is the page-level tolerance for deciding two words are on the same
+    /// visual row. Insensitive in the 1.0–4.0 range on the pilot corpus, and
+    /// set to pdf_oxide's own table-detector `row_tolerance` default.
+    const ROW_TOL: f32 = 2.8;
+
+    /// Rebuild a page's text as visual rows.
+    ///
+    /// `extract_text` emits words in content-stream order, which splits a table
+    /// row across several lines — "Masyarakat" on one line, "8.637.784.479
+    /// 46,60%" on the next — and defeats row-anchored parsing (CTRA, SMRA,
+    /// APLN all failed this way). Grouping by word-box `y` and sorting within a
+    /// row by `x` restores the row, so downstream line regexes see what a
+    /// human sees.
+    ///
+    /// ponytail: linear scan per word, O(words x rows) per page (~18k compares
+    /// on a dense page). Switch to a sorted sweep if a page ever gets slow.
+    fn page_rows_to_text(words: &[pdf_oxide::layout::Word]) -> String {
+        let mut rows: Vec<(f32, Vec<(f32, &str)>)> = Vec::new();
+        for w in words {
+            let y = w.bbox.y;
+            match rows.iter_mut().find(|(ry, _)| (*ry - y).abs() <= ROW_TOL) {
+                Some((_, v)) => v.push((w.bbox.x, w.text.as_str())),
+                None => rows.push((y, vec![(w.bbox.x, w.text.as_str())])),
+            }
+        }
+        // y grows upward in PDF space: descending y == top-to-bottom reading order
+        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut out = String::new();
+        for (_, mut row) in rows {
+            row.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (i, (_, t)) in row.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(t);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     fn extract_pdf_text<P: AsRef<Path>>(path: P) -> Result<String, Box<dyn Error>> {
         use pdf_oxide::PdfDocument;
         let doc = PdfDocument::open(path.as_ref())?;
         let mut text = String::new();
         let page_count = doc.page_count()?;
         for i in 0..page_count {
-            if let Ok(t) = doc.extract_text(i) {
-                text.push_str(&t);
+            if let Ok(words) = doc.extract_words(i) {
+                text.push_str(&page_rows_to_text(&words));
                 text.push('\n');
             }
         }
@@ -1251,13 +1294,31 @@ mod pdf_extract {
     // Algoritma: anchor ke note "Modal Saham/Capital Stock", cari baris publik
     // (keyword + jumlah saham dotted + persen koma inline) & baris Jumlah ~100%.
     // STRICT GATE: emit hanya bila cross-check public/total*100 == free_float (<=0.5pp).
-    // Layout yang pecah (nama & angka terpisah baris, mis. CTRA/SMRA) -> None
-    // (dikoding manual), supaya tidak pernah menghasilkan angka salah senyap.
+    // Layout yang pecah (nama & angka terpisah baris) sudah ditangani
+    // `page_rows_to_text`; di sini yang tersisa adalah memilih BARIS YANG BENAR,
+    // karena `\bpublic\b` juga cocok pada prosa dwibahasa ("a public notary",
+    // "Notice of Effectivity") yang tersebar jauh sebelum tabel Modal Saham.
     pub(crate) fn extract_ownership(text: &str) -> Option<(i64, i64, f64)> {
         // jumlah saham: integer besar ber-titik; persen: desimal koma (gaya Indonesia)
         let re_share = Regex::new(r"(\d{1,3}(?:\.\d{3})+)").unwrap();
-        let re_pct = Regex::new(r"(\d{1,3},\d+)\s*%?").unwrap();
-        let re_public = Regex::new(r"(?i)masyarakat|\bpublic\b").unwrap();
+        let re_pct = Regex::new(r"(\d{1,3},\d+)").unwrap();
+        // persen bulat: hanya bila diikuti '%' — tanpa itu, angka biasa seperti
+        // tahun atau jumlah saham ikut cocok. Dipakai KHUSUS untuk baris total,
+        // yang sebagian emiten tulis "100%" alih-alih "100,00" (CTRA).
+        let re_pct_whole = Regex::new(r"(\d{1,3})\s*%").unwrap();
+        // Label publik HARUS mengawali barisnya sendiri. Versi longgar
+        // (`\bpublic\b` di mana saja) juga cocok pada prosa dwibahasa
+        // ("a public notary", "Notice of Effectivity") sehingga baris direksi
+        // ikut terlabeli — itulah yang menghasilkan `Harun Hajadi ... 0,08%`.
+        let re_public_line =
+            Regex::new(r"(?i)^\s*(masyarakat|publik|lain-lain|others|public)\b").unwrap();
+        // Baris manajemen (dan sub-headernya) bukan pemegang publik, apa pun
+        // label di atasnya. CTRA: "Lain-lain (…kurang dari 5%)" adalah header
+        // KELOMPOK, di bawahnya ada sub-header "Manajemen:" lalu baris-baris
+        // direktur — sehingga baris direktur tampak "berlabel publik".
+        let re_manager =
+            Regex::new(r"(?i)direksi|komisaris|director|commissioner|manajemen|management")
+                .unwrap();
         let re_total = Regex::new(r"(?i)\bjumlah\b|\btotal\b|\bsub-total\b").unwrap();
 
         let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
@@ -1274,33 +1335,91 @@ mod pdf_extract {
                 .captures(l)
                 .and_then(|c| c[1].replace(',', ".").parse::<f64>().ok())
         };
-
-        // cari baris publik INLINE pertama (nama + saham + persen dalam satu baris).
-        // scan global (bukan anchor note) — sebutan "capital stock" muncul di narasi
-        // jauh sebelum tabel Modal Saham sebenarnya.
+        // baris total: persen koma lebih diutamakan; kalau tidak ada, terima "100%"
+        let total_pct = |l: &str| -> Option<f64> {
+            first_pct(l).or_else(|| {
+                re_pct_whole
+                    .captures(l)
+                    .and_then(|c| c[1].parse::<f64>().ok())
+            })
+        };
         let inline_row = |l: &str| -> bool { first_share(l).is_some() && first_pct(l).is_some() };
+        let inline_total = |l: &str| -> bool { first_share(l).is_some() && total_pct(l).is_some() };
 
-        let pub_idx = lines
-            .iter()
-            .position(|l| re_public.is_match(l) && inline_row(l))?;
+        // Label publik kadang terlipat ke baris di atasnya, sehingga baris angka
+        // sendiri tak memuat kata kunci: APLN "Masyarakat umum" satu baris di
+        // atas; SMRA "Lain-lain (masing-masing / dengan pemilikan kurang"
+        // dua baris di atas. Baris angka tetap satu baris (berkat
+        // page_rows_to_text); hanya labelnya yang melipat.
+        // Syaratnya: baris label harus MENGAWALI dengan kata kunci, dan semua
+        // baris antara label dan baris angka harus bebas angka (murni lanjutan
+        // label) — bukan sekadar "ada kata kunci dalam radius 3 baris".
+        const LABEL_LOOKBACK: usize = 3;
+        // Baris label harus baris label MURNI (tanpa saham+persen inline).
+        // Kalau tidak, baris Total yang tepat berada di bawah baris publik
+        // ("Masyarakat 8.637.784.479 46,60%") akan lolos sebagai kandidat
+        // dengan persen 100 — itulah yang membuat DILD mengembalikan 100,0.
+        let label_above = |i: usize| -> bool {
+            (1..=LABEL_LOOKBACK.min(i)).any(|k| {
+                let l = lines[i - k];
+                re_public_line.is_match(l)
+                    && !inline_row(l)
+                    && lines[(i - k + 1)..i]
+                        .iter()
+                        .all(|m| !inline_row(m) && !re_manager.is_match(m))
+            })
+        };
 
-        // cari baris Jumlah/Total INLINE terdekat setelahnya (<=40 baris)
-        let total_idx = lines[(pub_idx + 1)..(pub_idx + 41).min(n)]
-            .iter()
-            .position(|l| re_total.is_match(l) && inline_row(l))
-            .map(|k| pub_idx + 1 + k)?;
+        // Kandidat PERTAMA yang lolos dipakai, bukan persen terbesar: halaman
+        // memuat tabel tahun berjalan LALU tahun sebelumnya, dan angka tahun
+        // sebelumnya bisa lebih besar (BSDE 30,00 vs 28,94) sehingga "terbesar"
+        // memilih tahun yang salah. Versi lama juga memakai kandidat pertama —
+        // yang salah di CTRA (0,08) bukan karena urutannya, melainkan karena
+        // baris direktur ikut lolos gate. Sekarang baris itu diblokir gerbang
+        // identitas di atas, jadi urutan dokumen kembali bermakna.
+        // ponytail: mengandalkan urutan dokumen (tahun berjalan dulu). Kalau ada
+        // emiten yang membalik urutan, jalur vision (Fase 3-5) yang cross-check.
+        let mut best: Option<(i64, i64, f64)> = None;
 
-        let public_shares = first_share(lines[pub_idx])?;
-        let free_float = first_pct(lines[pub_idx])?;
-        let total_shares = first_share(lines[total_idx])?;
-        let total_pct = first_pct(lines[total_idx])?;
+        for i in 0..n {
+            // baris total/manajemen bukan baris pemegang publik
+            if !inline_row(lines[i]) || re_manager.is_match(lines[i]) || re_total.is_match(lines[i])
+            {
+                continue;
+            }
+            if !(re_public_line.is_match(lines[i]) || label_above(i)) {
+                continue;
+            }
 
-        // total row harus ~100%; cross-check rasio publik == free_float
-        let total_ok = (99.5..=100.05).contains(&total_pct);
-        let xcheck_ok = total_shares > 0
-            && (100.0 * public_shares as f64 / total_shares as f64 - free_float).abs() <= 0.5;
+            // baris Jumlah/Total INLINE terdekat setelahnya (<=40 baris)
+            let Some(ti) = lines[(i + 1)..(i + 41).min(n)]
+                .iter()
+                .position(|l| re_total.is_match(l) && inline_total(l))
+                .map(|k| i + 1 + k)
+            else {
+                continue;
+            };
 
-        (total_ok && xcheck_ok).then_some((public_shares, total_shares, free_float))
+            let (Some(public_shares), Some(free_float), Some(total_shares), Some(total_pct)) = (
+                first_share(lines[i]),
+                first_pct(lines[i]),
+                first_share(lines[ti]),
+                total_pct(lines[ti]),
+            ) else {
+                continue;
+            };
+
+            // total row harus ~100%; cross-check rasio publik == free_float
+            let total_ok = (99.5..=100.05).contains(&total_pct);
+            let xcheck_ok = total_shares > 0
+                && (100.0 * public_shares as f64 / total_shares as f64 - free_float).abs() <= 0.5;
+
+            if total_ok && xcheck_ok && best.is_none() {
+                best = Some((public_shares, total_shares, free_float));
+            }
+        }
+
+        best
     }
 }
 
@@ -1469,6 +1588,113 @@ Jumlah 48.159.602.400 100,00 1.203.990.060 Total\n";
         assert_eq!(free_float_pct, 31.30);
         assert_eq!(public_shares, 15_070_264_960);
         assert_eq!(total_shares, 48_159_602_400);
+    }
+
+    #[test]
+    fn test_extract_ownership_ctra_identity_gate() {
+        // CTRA 2023 (teks layout-aware dari page_rows_to_text): baris direktur
+        // "Harun Hajadi 14.399.560 0,08%" berada DI ATAS baris publik
+        // "Masyarakat 8.637.784.479 46,60%". Versi lama mengambil kandidat
+        // PERTAMA yang lolos gate -> 0,08 (salah, tapi lolos gate karena
+        // 0,08% memang rasio baris itu terhadap total).
+        let txt = "Manajemen: Management:\n\
+Harun Hajadi 14.399.560 0,08% 3.600 Harun Hajadi\n\
+Nanik J. Santoso 857.039 0,00% 214 Nanik J. Santoso\n\
+Masyarakat 8.637.784.479 46,60% 2.159.446 Public\n\
+Jumlah 18.535.695.255 100% 4.633.924 Total\n";
+        let (ps, ts, ff) =
+            super::pdf_extract::extract_ownership(txt).expect("CTRA row-major must parse");
+        assert_eq!(ff, 46.60);
+        assert_eq!(ps, 8_637_784_479);
+        assert_eq!(ts, 18_535_695_255);
+    }
+
+    #[test]
+    fn test_no_secrets_or_local_paths_in_tracked_files() {
+        // Gerbang sanitasi (Fase 7): gagal bila ada kunci API atau jalur mesin
+        // pribadi yang bocor ke berkas terlacak. Pola dirakit dari potongan
+        // supaya berkas ini sendiri tidak memicu positif palsu.
+        let pats = [
+            ["s", "k-"].concat(),
+            ["B", "ear", "er "].concat(),
+            ["api", "_", "key"].concat(),
+            ["API", "_", "KEY"].concat(),
+            ["HERMES_CUSTOM", "_API"].concat(),
+            ["infer", "hub.dev"].concat(),
+            ["BEGIN ", "PRIVATE"].concat(),
+            ["/home/", "micro", "devil"].concat(),
+        ];
+        let Ok(o) = process::Command::new("git").args(["ls-files"]).output() else {
+            return; // bukan repo git (mis. build dari tarball) -> lewati
+        };
+        let files = String::from_utf8_lossy(&o.stdout);
+        let mut hits: Vec<String> = Vec::new();
+        for f in files.lines() {
+            let f = f.trim();
+            if f.is_empty() {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(f) else {
+                continue; // berkas biner -> tidak diperiksa
+            };
+            for p in &pats {
+                if body.contains(p.as_str()) {
+                    hits.push(format!("{} <- {}", f, p));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "kebocoran di berkas terlacak (kunci API / jalur pribadi): {:#?}",
+            hits
+        );
+    }
+
+    #[test]
+    fn test_extract_ownership_rejects_total_row_as_candidate() {
+        // DILD: baris Total tepat di bawah baris publik. Versi yang membolehkan
+        // "label di baris atas" tanpa syarat baris-label-murni menjadikan baris
+        // Total sebagai kandidat berlabel (100%) — mengembalikan 100,0.
+        let txt = "Lain-lain (masing-masing di bawah 5%)\n\
+Masyarakat lainnya 3.788.659.282 36,55% 947.164.821 Others\n\
+Jumlah 10.365.854.185 100,00 2.591.463.546 Total\n";
+        let (_, _, ff) = super::pdf_extract::extract_ownership(txt).expect("must parse");
+        assert_eq!(ff, 36.55, "baris Total tidak boleh jadi kandidat");
+    }
+
+    #[test]
+    fn test_extract_ownership_prefers_current_year_table() {
+        // BSDE: halaman memuat tabel tahun berjalan LALU tahun sebelumnya, dan
+        // persen tahun sebelumnya lebih besar (30,00 vs 28,94). Aturan "ambil
+        // persen terbesar" memilih tahun yang SALAH; kandidat pertama benar.
+        let txt = "Masyarakat/Public 6.053.131.112 28,94% 605.313.111 Public\n\
+Jumlah 20.913.395.112 100,00 2.091.339.511 Total\n\
+31 Desember/December 31 2022\n\
+Masyarakat/Public 6.250.000.000 30,00% 625.000.000 Public\n\
+Jumlah 20.833.333.333 100,00 2.083.333.333 Total\n";
+        let (_, _, ff) = super::pdf_extract::extract_ownership(txt).expect("must parse");
+        assert_eq!(
+            ff, 28.94,
+            "harus mengambil tabel tahun berjalan, bukan terbesar"
+        );
+    }
+
+    #[test]
+    fn test_extract_ownership_rejects_director_under_group_header() {
+        // CTRA: "Lain-lain (…kurang dari 5%)" adalah header KELOMPOK, di bawahnya
+        // sub-header "Manajemen:" lalu baris direktur. Baris direktur tidak boleh
+        // dianggap "berlabel publik" hanya karena header grup ada 3 baris di atas.
+        let txt = "Lain-lain (masing-masing dengan Others (each below\n\
+pemilikan kurang dari 5%): 5% ownership):\n\
+Manajemen: Management:\n\
+Harun Hajadi 14.399.560 0,08% 3.600 Harun Hajadi\n\
+Masyarakat 8.637.784.479 46,60% 2.159.446 Public\n\
+Jumlah 18.535.695.255 100% 4.633.924 Total\n";
+        let (_, _, ff) = super::pdf_extract::extract_ownership(txt).expect("must parse");
+        assert_eq!(
+            ff, 46.60,
+            "baris direktur di bawah header grup harus ditolak"
+        );
     }
 
     #[test]
