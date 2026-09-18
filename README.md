@@ -66,6 +66,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 * **Standardized Control Variables**: Automatically maps `Assets`, `Liabilities`, `Equity`, `SalesAndRevenue`, and `ProfitLoss` to current-period instants and durations.
 * **Econometric Spread Estimation**: Computes the gold-standard Corwin & Schultz (2012) two-day high-low bid-ask spread estimator, plus Zero-Return-Days and daily-return volatility, to quantify information asymmetry without requiring proprietary intraday tick data.
 * **Share-Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. A self-consistency gate alone is insufficient — every row satisfies `public/total == printed percent`, including a director's line — so it is paired with a row-identity gate. Either gate failing yields `null`.
+* **Page Provenance and Loud Unreadable-PDF Failure**: Each PDF-derived field records the 1-based page it was anchored to (`pdf_ip_region_page`), so any value can be re-opened and confirmed at its source. A PDF with no extractable text layer (scanned or image-only) fails with an explicit error instead of returning empty fields — otherwise "could not be read" would be indistinguishable from "the note is absent" and would silently shrink the sample.
 * **Sanitized & Portable**: Zero hardcoded local machine paths; configurable via environment variables (`IDXPRISM_DATA`, `IDXPRISM_BIN`).
 
 ---

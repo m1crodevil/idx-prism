@@ -42,6 +42,11 @@ struct FinancialReportData {
     pdf_appraisal_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pdf_property_location_composition: Option<String>,
+    /// 1-based page in the source PDF where the investment-property note region
+    /// was anchored. Audit provenance: every extracted value must be traceable
+    /// to the page it came from, so a reviewer can re-open and confirm it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf_ip_region_page: Option<usize>,
 
     // Komposisi kepemilikan saham (CALK note Modal Saham)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +169,7 @@ fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
         report.pdf_appraiser_name = extracted.appraiser_name;
         report.pdf_appraisal_date = extracted.appraisal_date;
         report.pdf_property_location_composition = extracted.property_location_composition;
+        report.pdf_ip_region_page = extracted.ip_region_page;
         if let Some((public_shares, total_shares, free_float_pct)) = extracted.ownership {
             report.public_shares = Some(public_shares);
             report.shares_outstanding = Some(total_shares);
@@ -1201,12 +1207,26 @@ mod pdf_extract {
         /// strict cross-check in `extract_ownership` emits nothing unless every
         /// component was verified, so a partial tuple never occurs.
         pub ownership: Option<(i64, i64, f64)>,
+        /// 1-based page holding the investment-property region; `None` when no
+        /// anchor matched and the region fell back to the whole document.
+        pub ip_region_page: Option<usize>,
     }
 
     pub fn extract_pdf_fields<P: AsRef<Path>>(path: P) -> Result<PdfExtracted, Box<dyn Error>> {
-        let text = extract_pdf_text(path)?;
+        let (text, page_starts) = extract_pdf_text(path)?;
         let lower = text.to_lowercase();
         let ip_region = investment_property_region(&text, &lower);
+        // Pointer arithmetic recovers the region's byte offset inside `text`.
+        // When the anchor missed, the region IS the whole document, so there is
+        // no page to report — say `None` rather than claiming page 1.
+        let ip_region_page = if ip_region.len() == text.len() {
+            None
+        } else {
+            page_of(
+                ip_region.as_ptr() as usize - text.as_ptr() as usize,
+                &page_starts,
+            )
+        };
 
         Ok(PdfExtracted {
             fair_value_amount: extract_fair_value_amount(ip_region),
@@ -1215,6 +1235,7 @@ mod pdf_extract {
             property_location_composition: extract_property_location(ip_region),
             accounting_policy: extract_accounting_policy(&text),
             ownership: extract_ownership(&text),
+            ip_region_page,
         })
     }
 
@@ -1261,18 +1282,48 @@ mod pdf_extract {
         out
     }
 
-    fn extract_pdf_text<P: AsRef<Path>>(path: P) -> Result<String, Box<dyn Error>> {
+    fn extract_pdf_text<P: AsRef<Path>>(path: P) -> Result<(String, Vec<usize>), Box<dyn Error>> {
         use pdf_oxide::PdfDocument;
         let doc = PdfDocument::open(path.as_ref())?;
         let mut text = String::new();
+        // page_starts[i] = byte offset where page i+1 begins; page_of() maps a
+        // match offset back to its page so every value carries provenance.
+        let mut page_starts: Vec<usize> = Vec::new();
         let page_count = doc.page_count()?;
+        let mut words_seen = 0usize;
         for i in 0..page_count {
             if let Ok(words) = doc.extract_words(i) {
+                words_seen += words.len();
+                page_starts.push(text.len());
                 text.push_str(&page_rows_to_text(&words));
                 text.push('\n');
             }
         }
-        Ok(text)
+        // A PDF with no extractable words cannot be read by this route at all.
+        // Returning empty text would let "unreadable" masquerade as "nothing
+        // found" — the CLI would print all-null and look like a clean miss.
+        // Fail loudly instead; the caller can then pick another document or
+        // send this page through the OCR route.
+        if words_seen == 0 {
+            return Err(format!(
+                "no extractable text layer in {} ({} pages, 0 words) — this PDF is \
+                 scanned or image-only; text extraction cannot read it",
+                path.as_ref().display(),
+                page_count
+            )
+            .into());
+        }
+        Ok((text, page_starts))
+    }
+
+    /// Map a byte offset in the concatenated page text to its 1-based page.
+    /// `starts` is ascending, so this is a binary-search predecessor lookup.
+    pub(crate) fn page_of(offset: usize, starts: &[usize]) -> Option<usize> {
+        match starts.binary_search(&offset) {
+            Ok(i) => Some(i + 1),
+            Err(0) => None,
+            Err(i) => Some(i),
+        }
     }
 
     fn investment_property_region<'a>(text: &'a str, lower: &'a str) -> &'a str {
@@ -1895,6 +1946,20 @@ Jumlah\n\
 18.535.695.255\n\
 100%\n";
         assert_eq!(super::pdf_extract::extract_ownership(txt), None);
+    }
+
+    #[test]
+    fn test_page_of_maps_offsets_to_pages() {
+        // pages start at 0 / 100 / 250
+        let starts = [0usize, 100, 250];
+        assert_eq!(super::pdf_extract::page_of(0, &starts), Some(1));
+        assert_eq!(super::pdf_extract::page_of(99, &starts), Some(1));
+        assert_eq!(super::pdf_extract::page_of(100, &starts), Some(2));
+        assert_eq!(super::pdf_extract::page_of(249, &starts), Some(2));
+        assert_eq!(super::pdf_extract::page_of(250, &starts), Some(3));
+        assert_eq!(super::pdf_extract::page_of(9999, &starts), Some(3));
+        // empty index: an offset belongs to no page, and must not panic
+        assert_eq!(super::pdf_extract::page_of(500, &[]), None);
     }
 
     #[test]
