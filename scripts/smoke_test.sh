@@ -69,12 +69,19 @@ if [ -f /tmp/pwon_yahoo.json ]; then
   "$BIN" market -i /tmp/pwon_yahoo.json --format json >/dev/null 2>&1; check "market json" $? 0
 fi
 
-echo "== smoke: batch script =="
-if [ -x ./scripts/batch_extract.sh ]; then
-  ./scripts/batch_extract.sh /tmp/sm_batch.csv >/dev/null 2>&1; check "batch_extract.sh" $? 0
+echo "== smoke: batch subcommand =="
+rm -rf /tmp/sm_bt && mkdir -p /tmp/sm_bt/PWON/2023
+ln -s "$DATA/PWON/2023/Audit" /tmp/sm_bt/PWON/2023/Audit 2>/dev/null
+if [ -e /tmp/sm_bt/PWON/2023/Audit/instance.zip ]; then
+  "$BIN" batch -d /tmp/sm_bt -o /tmp/sm_batch.csv >/dev/null 2>&1; check "batch -d" $? 0
   r=$(wc -l </tmp/sm_batch.csv); [ "$r" -gt 1 ] && ok "batch rows=$r" || bad "batch produced no rows"
+  head -1 /tmp/sm_batch.csv | grep -q "^ticker,year,accounting_model" && ok "batch header" || bad "batch header"
+  grep -q "^PWON,2023," /tmp/sm_batch.csv && ok "batch row has PWON" || bad "batch row missing"
+  # help path
+  "$BIN" batch -h >/dev/null 2>&1; check "batch -h" $? 0
+  "$BIN" -h >/dev/null 2>&1; check "extract -h" $? 0
 else
-  echo "  skip  batch (run from repo root)"
+  echo "  skip  batch (no local PWON data)"
 fi
 
 echo

@@ -108,6 +108,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("sector") => run_sector(&args[1..]),
         Some("market") => run_market(&args[1..]),
+        Some("batch") => run_batch(&args[1..]),
         _ => run_extract(args),
     };
 
@@ -150,6 +151,22 @@ fn flag<'a>(m: &'a HashMap<String, String>, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|n| m.get(*n)).map(String::as_str)
 }
 
+/// Print `usage` and exit 0 when `-h`/`--help` was passed. One copy, so a
+/// subcommand cannot silently lack help (`extract` previously had none and
+/// answered `-h` with "Error: -y / --year is required").
+fn help_if_requested(m: &HashMap<String, String>, usage: &str) {
+    if m.contains_key("-h") || m.contains_key("--help") {
+        eprintln!("{}", usage);
+        process::exit(0);
+    }
+}
+
+const USAGE_EXTRACT: &str = "usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]";
+const USAGE_SECTOR: &str = "usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]";
+const USAGE_MARKET: &str = "usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]";
+const USAGE_BATCH: &str =
+    "usage: idx-prism batch -d <data_dir> [--years <from>-<to>] [-o <out.csv>]";
+
 // -------------------------------------------------------------------------
 // Subcommand 1: Financial & CALK Extract
 // -------------------------------------------------------------------------
@@ -165,41 +182,7 @@ fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
 
     if let Some(pdf_path) = &args.pdf {
         let extracted = pdf_extract::extract_pdf_fields(pdf_path)?;
-        report.pdf_fair_value_amount = extracted.fair_value_amount;
-        report.pdf_appraiser_name = extracted.appraiser_name;
-        report.pdf_appraisal_date = extracted.appraisal_date;
-        report.pdf_property_location_composition = extracted.property_location_composition;
-        report.pdf_ip_region_page = extracted.ip_region_page;
-        if let Some((public_shares, total_shares, free_float_pct)) = extracted.ownership {
-            report.public_shares = Some(public_shares);
-            report.shares_outstanding = Some(total_shares);
-            report.free_float_pct = Some((free_float_pct * 100.0).round() / 100.0);
-        }
-
-        if report.accounting_model == "unknown"
-            || report
-                .policy_text
-                .trim()
-                .to_lowercase()
-                .starts_with("idem row")
-            || report.policy_text.trim().len() < 20
-        {
-            if let Some(ref pdf_policy) = extracted.accounting_policy {
-                let model_from_pdf = detect_model(pdf_policy);
-                if model_from_pdf != "unknown" {
-                    report.accounting_model = model_from_pdf;
-                    if report.policy_text.trim().len() < 20
-                        || report
-                            .policy_text
-                            .trim()
-                            .to_lowercase()
-                            .starts_with("idem row")
-                    {
-                        report.policy_text = pdf_policy.clone();
-                    }
-                }
-            }
-        }
+        apply_pdf(&mut report, extracted);
     }
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -211,6 +194,42 @@ fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+/// Merge PDF-derived fields into the XBRL-derived report. One copy, so the
+/// single-file (`extract`) and corpus (`batch`) paths cannot drift apart.
+fn apply_pdf(report: &mut FinancialReportData, extracted: pdf_extract::PdfExtracted) {
+    report.pdf_fair_value_amount = extracted.fair_value_amount;
+    report.pdf_appraiser_name = extracted.appraiser_name;
+    report.pdf_appraisal_date = extracted.appraisal_date;
+    report.pdf_property_location_composition = extracted.property_location_composition;
+    report.pdf_ip_region_page = extracted.ip_region_page;
+    if let Some((public_shares, total_shares, free_float_pct)) = extracted.ownership {
+        report.public_shares = Some(public_shares);
+        report.shares_outstanding = Some(total_shares);
+        report.free_float_pct = Some((free_float_pct * 100.0).round() / 100.0);
+    }
+
+    // XBRL policy text is sometimes a cross-reference placeholder ("Idem row
+    // 10") or absent entirely — every FY2021 filing has none, since IDX did
+    // not tag the notes that year. The audited PDF is then the only source.
+    let placeholder = report.policy_text.trim().len() < 20
+        || report
+            .policy_text
+            .trim()
+            .to_lowercase()
+            .starts_with("idem row");
+    if report.accounting_model == "unknown" || placeholder {
+        if let Some(ref pdf_policy) = extracted.accounting_policy {
+            let model_from_pdf = detect_model(pdf_policy);
+            if model_from_pdf != "unknown" {
+                report.accounting_model = model_from_pdf;
+                if placeholder {
+                    report.policy_text = pdf_policy.clone();
+                }
+            }
+        }
+    }
 }
 
 struct ExtractArgs {
@@ -227,6 +246,8 @@ fn parse_extract_args(raw_args: &[String]) -> ExtractArgs {
         &["-y", "--year", "-f", "--file", "--pdf", "-o", "--output"],
     );
 
+    help_if_requested(&m, USAGE_EXTRACT);
+
     let year = flag(&m, &["-y", "--year"]).and_then(|v| v.parse::<u32>().ok());
     let file = flag(&m, &["-f", "--file"]).map(PathBuf::from);
     let ticker = positional.last().cloned().unwrap_or_default();
@@ -236,11 +257,11 @@ fn parse_extract_args(raw_args: &[String]) -> ExtractArgs {
         process::exit(1);
     };
     let Some(file) = file.filter(|f| !f.as_os_str().is_empty()) else {
-        eprintln!("usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
+        eprintln!("{}", USAGE_EXTRACT);
         process::exit(1);
     };
     if ticker.is_empty() {
-        eprintln!("usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]");
+        eprintln!("{}", USAGE_EXTRACT);
         process::exit(1);
     }
 
@@ -281,10 +302,7 @@ fn parse_sector_args(args: &[String]) -> SectorArgs {
         ],
     );
 
-    if m.contains_key("-h") || m.contains_key("--help") {
-        eprintln!("usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]");
-        process::exit(0);
-    }
+    help_if_requested(&m, USAGE_SECTOR);
 
     SectorArgs {
         input: flag(&m, &["-i", "--input"]).map(PathBuf::from),
@@ -468,10 +486,7 @@ fn parse_market_args(args: &[String]) -> Result<MarketArgs, Box<dyn Error>> {
         ],
     );
 
-    if m.contains_key("-h") || m.contains_key("--help") {
-        eprintln!("usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]");
-        process::exit(0);
-    }
+    help_if_requested(&m, USAGE_MARKET);
 
     let input = flag(&m, &["-i", "--input"])
         .map(PathBuf::from)
@@ -829,15 +844,7 @@ fn parse_yahoo_json(bytes: &[u8]) -> Result<(String, Vec<DailyBar>), Box<dyn Err
         let c = closes.get(i).and_then(|&x| x).unwrap_or(0.0);
         let v = volumes.get(i).and_then(|&x| x).unwrap_or(0);
 
-        if h > 0.0 && l > 0.0 && c > 0.0 && h >= l {
-            bars.push(DailyBar {
-                year,
-                high: h,
-                low: l,
-                close: c,
-                volume: v,
-            });
-        }
+        push_bar(&mut bars, year, h, l, c, v);
     }
 
     Ok((ticker, bars))
@@ -891,32 +898,34 @@ fn parse_daily_csv(
             .map(|x| x as u64)
             .unwrap_or(0);
 
-        if h > 0.0 && l > 0.0 && c > 0.0 && h >= l {
-            bars.push(DailyBar {
-                year,
-                high: h,
-                low: l,
-                close: c,
-                volume: v,
-            });
-        }
+        push_bar(&mut bars, year, h, l, c, v);
     }
 
     Ok((default_ticker.to_uppercase(), bars))
 }
 
+/// Append a bar only when its OHLC is usable. One copy: the Yahoo and CSV
+/// parsers must agree on what counts as a valid bar, or the two paths drift.
+fn push_bar(bars: &mut Vec<DailyBar>, year: u32, high: f64, low: f64, close: f64, volume: u64) {
+    if high > 0.0 && low > 0.0 && close > 0.0 && high >= low {
+        bars.push(DailyBar {
+            year,
+            high,
+            low,
+            close,
+            volume,
+        });
+    }
+}
+
 fn epoch_to_year(ts: i64) -> u32 {
-    let days = ts / 86400;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1020 + doe / 1461 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let final_y = if m <= 2 { y + 1 } else { y };
-    final_y as u32
+    use chrono::Datelike;
+    // `chrono` is already in the dependency tree (via pdf_oxide), so this is a
+    // manifest line, not a new compile. The previous hand-rolled days-from-civil
+    // inverse was correct but 13 lines of arithmetic nobody should re-verify.
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.year() as u32)
+        .unwrap_or(0)
 }
 
 // -------------------------------------------------------------------------
@@ -1594,6 +1603,261 @@ mod pdf_extract {
 
         None
     }
+}
+
+// -------------------------------------------------------------------------
+// Subcommand 4: Batch dataset build
+// -------------------------------------------------------------------------
+
+const BATCH_HEADER: &str = "ticker,year,accounting_model,current_ip,prior_ip,assets,liabilities,equity,revenues,net_income,has_fv_disclosure,appraiser,free_float_pct,public_shares,shares_outstanding,pdf_file,review_required";
+
+struct BatchArgs {
+    data_dir: PathBuf,
+    out: Option<PathBuf>,
+    years: Option<(u32, u32)>,
+}
+
+fn parse_batch_args(args: &[String]) -> Result<BatchArgs, Box<dyn Error>> {
+    let (m, _) = parse_flags(args, &["-d", "--dir", "--years", "-o", "--output"]);
+    help_if_requested(&m, USAGE_BATCH);
+
+    let data_dir = flag(&m, &["-d", "--dir"])
+        .map(PathBuf::from)
+        .ok_or("Error: -d / --dir <data_dir> is required")?;
+    let years = flag(&m, &["--years"]).and_then(|v| {
+        let (a, b) = v.split_once('-')?;
+        Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+    });
+
+    Ok(BatchArgs {
+        data_dir,
+        out: flag(&m, &["-o", "--output"]).map(PathBuf::from),
+        years,
+    })
+}
+
+/// Locate every `<ticker>/<year>/{Audit,FY}/instance.zip` under `data_dir`.
+fn discover_instances(data_dir: &Path, years: Option<(u32, u32)>) -> Vec<(String, u32, PathBuf)> {
+    let mut found = Vec::new();
+    let Ok(tickers) = fs::read_dir(data_dir) else {
+        return found;
+    };
+    for t in tickers.flatten() {
+        let Some(ticker) = t.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(year_dirs) = fs::read_dir(t.path()) else {
+            continue;
+        };
+        for y in year_dirs.flatten() {
+            let Some(year) = y.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if years.is_some_and(|(a, b)| year < a || year > b) {
+                continue;
+            }
+            for sub in ["Audit", "FY"] {
+                let zip = y.path().join(sub).join("instance.zip");
+                if zip.is_file() {
+                    found.push((ticker.clone(), year, zip));
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// PDFs sitting beside a filing, largest first. Size only sets the starting
+/// order — the winner is chosen by what it yields, not by its name or bulk.
+fn candidate_pdfs(zip: &Path) -> Vec<PathBuf> {
+    let Some(dir) = zip.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut pdfs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+        .collect();
+    pdfs.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    pdfs
+}
+
+/// How many PDF-derived fields a document actually fills — the selection score.
+fn score_pdf(e: &pdf_extract::PdfExtracted) -> usize {
+    [
+        e.fair_value_amount.is_some(),
+        e.appraiser_name.is_some(),
+        e.appraisal_date.is_some(),
+        e.property_location_composition.is_some(),
+        e.accounting_policy.is_some(),
+        e.ownership.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count()
+}
+
+/// RFC4180 quoting: wrap a field only when it contains a delimiter or quote.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn opt_i64(v: Option<i64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
+fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
+    let args = parse_batch_args(raw_args)?;
+    let instances = discover_instances(&args.data_dir, args.years);
+    if instances.is_empty() {
+        return Err(format!(
+            "no <ticker>/<year>/(Audit|FY)/instance.zip found under {}",
+            args.data_dir.display()
+        )
+        .into());
+    }
+
+    let mut rows = vec![BATCH_HEADER.to_string()];
+    let mut failures: Vec<String> = Vec::new();
+    let mut no_readable_pdf = 0usize;
+
+    for (ticker, year, zip) in &instances {
+        let data = match fs::read(zip) {
+            Ok(d) => d,
+            Err(e) => {
+                failures.push(format!(
+                    "{} {}: read {}: {}",
+                    ticker,
+                    year,
+                    zip.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        let mut report = match extract_xbrl_data(&data) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("{} {}: {}", ticker, year, e));
+                continue;
+            }
+        };
+        report.ticker = ticker.clone();
+        report.year = *year;
+        report.accounting_model = detect_model(&report.policy_text);
+
+        // Select the PDF by OUTCOME, not by filename. Name-based rules picked a
+        // document that yielded nothing for 4 of 72 emiten-years (ASRI/FMII/KIJA
+        // 2021, CTRA 2024) while a sibling PDF held the values. Documents that
+        // disagree on free float are surfaced rather than silently averaged.
+        let candidates = candidate_pdfs(zip);
+        let mut chosen: Option<(String, usize, pdf_extract::PdfExtracted)> = None;
+        let mut free_floats: Vec<f64> = Vec::new();
+        for pdf in &candidates {
+            // A scanned PDF has no text layer and now errors instead of
+            // returning nulls; that is a genuine "cannot read", so skip it.
+            let Ok(extracted) = pdf_extract::extract_pdf_fields(pdf) else {
+                continue;
+            };
+            if let Some((_, _, ff)) = extracted.ownership {
+                free_floats.push(ff);
+            }
+            let score = score_pdf(&extracted);
+            if chosen.as_ref().is_none_or(|(_, best, _)| score > *best) {
+                let name = pdf
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                chosen = Some((name, score, extracted));
+            }
+        }
+        if !candidates.is_empty() && chosen.is_none() {
+            no_readable_pdf += 1;
+        }
+
+        let pdf_file = chosen
+            .as_ref()
+            .map(|(n, _, _)| n.clone())
+            .unwrap_or_default();
+        apply_pdf(&mut report, chosen.map(|(_, _, e)| e).unwrap_or_default());
+
+        let spread = free_floats
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(*v), hi.max(*v))
+            });
+        let review = free_floats.len() > 1 && (spread.1 - spread.0) > 0.005;
+
+        let row = [
+            report.ticker.clone(),
+            report.year.to_string(),
+            report.accounting_model.clone(),
+            opt_i64(report.current_year_instant),
+            opt_i64(report.prior_year_instant),
+            opt_i64(report.total_assets),
+            opt_i64(report.total_liabilities),
+            opt_i64(report.equity),
+            opt_i64(report.revenues),
+            opt_i64(report.net_income),
+            if report.pdf_fair_value_amount.is_some() {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+            report.pdf_appraiser_name.clone().unwrap_or_default(),
+            report
+                .free_float_pct
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            opt_i64(report.public_shares),
+            opt_i64(report.shares_outstanding),
+            pdf_file,
+            if review { "1" } else { "0" }.to_string(),
+        ];
+        rows.push(
+            row.iter()
+                .map(|c| csv_field(c))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    let out = rows.join("\n") + "\n";
+    match &args.out {
+        Some(p) => {
+            fs::write(p, &out)?;
+            eprintln!("Dataset tersimpan di {}", p.display());
+        }
+        None => print!("{}", out),
+    }
+
+    eprintln!(
+        "[batch] {} filings, {} readable-PDF selections, {} had no readable PDF",
+        instances.len(),
+        instances.len() - failures.len(),
+        no_readable_pdf
+    );
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("[batch] GAGAL: {}", f);
+        }
+        return Err(format!(
+            "{} of {} filings could not be extracted",
+            failures.len(),
+            instances.len()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

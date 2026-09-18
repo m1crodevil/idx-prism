@@ -6,11 +6,5 @@ target/
 .env.*
 *.key
 
-# Artefak jalur vision (Fase 1-6): PNG halaman, cache API, bukti per-emiten.
-# Bukan kode; diregenerasi dari PDF sumber.
-/out/
-/cache/
-*.png
-
 # PDF/laporan sumber tidak di-commit (besar, dan sudah ada di ~/.idxlens/data)
 *.pdf

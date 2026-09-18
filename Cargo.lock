@@ -649,6 +649,7 @@ dependencies = [
 name = "idx-prism"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "pdf_oxide",
  "quick-xml 0.36.2",
  "regex",

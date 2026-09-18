@@ -211,13 +211,17 @@ PWON,2023,239,0.024608,0.007184,1.045100e-12,0.113445,0.015110,0.000637,73376060
 
 ### 4. Automated Batch Processing
 
-Consolidate all downloaded reports into a unified panel CSV in seconds:
+Consolidate every downloaded report into a unified panel CSV:
 
 ```bash
-./scripts/batch_extract.sh dataset_properti_panel.csv
+idx-prism batch -d ~/.idxlens/data --years 2021-2024 -o dataset_properti_panel.csv
 ```
 
-**Output columns:** ticker, year, accounting model, investment property amounts, control variables (assets/liabilities/equity/revenue/net income), fair value disclosure flag, appraiser names, and free-float ownership proxy (`free_float_pct`, `public_shares`, `shares_outstanding`). Ownership fields are `null` when either gate fails.
+The PDF for each filing is chosen **by outcome, not by filename**: every PDF beside the filing is tried and the one that fills the most fields wins, with the winner recorded in `pdf_file`. Filename rules picked a document that yielded nothing for 4 of 72 emiten-years while a sibling PDF held the values. When two documents disagree on the free-float percentage the row is flagged `review_required=1` rather than silently keeping one — the BSDE 2023 filing ships two PDFs for different reporting periods (`28.94` vs `33.91`).
+
+Filings that cannot be extracted are reported on stderr and the process exits non-zero, so a partial run cannot pass for a complete one.
+
+**Output columns:** ticker, year, accounting model, investment property amounts, control variables (assets/liabilities/equity/revenue/net income), fair value disclosure flag, appraiser names, free-float ownership proxy (`free_float_pct`, `public_shares`, `shares_outstanding`), the source document (`pdf_file`), and a disagreement flag (`review_required`). Ownership fields are empty when either gate fails.
 
 **`accounting_model` values:** `cost model`, `fair value model`, `revaluation model`, or `unknown`. Classification reads the *measurement sentence* — the one stating how the property is measured **after initial recognition** — rather than mere keyword presence, because every fair-value issuer also writes "at cost on initial recognition", and a keyword match misclassifies them as cost model.
 
