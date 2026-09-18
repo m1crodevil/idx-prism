@@ -1058,11 +1058,10 @@ fn read_text_content<R: BufRead>(reader: &mut Reader<R>) -> Result<String, Box<d
 /// dan indikator biaya harus POSITIF (penyusutan/akumulasi/model biaya), bukan
 /// sekadar kata "biaya".
 fn detect_model(policy: &str) -> String {
-    let raw = policy.to_lowercase();
+    let mut lower = policy.to_lowercase();
     // Negasi: "tidak disusutkan" / "not depreciated" adalah penanda MODEL NILAI
     // WAJAR (FV tidak disusutkan), bukan penanda biaya. Tanpa ini, PLIN
     // (yang menyatakan "menggunakan model nilai wajar") terbaca `cost model`.
-    let mut lower = raw.clone();
     for neg in [
         "tidak disusutkan",
         "tidak diamortisasi",
@@ -1108,25 +1107,20 @@ fn detect_model(policy: &str) -> String {
     // ponytail: bergantung urutan kronologis dalam catatan. Kalau ada emiten yang
     // menulis kebijakan terkini lebih dulu, cross-check PDF/vision (Fase 4).
     let mut governing: Option<(usize, &str)> = None;
-    for a in [
-        "menggunakan model nilai wajar",
-        "uses the fair value model",
-        "menggunakan model biaya",
-        "uses the cost model",
+    for (a, model) in [
+        ("menggunakan model nilai wajar", "fair value model"),
+        ("uses the fair value model", "fair value model"),
+        ("menggunakan model biaya", "cost model"),
+        ("uses the cost model", "cost model"),
     ] {
         if let Some(i) = lower.rfind(a) {
-            let is_fv = a.contains("nilai wajar") || a.contains("fair value");
             if governing.is_none_or(|(pos, _)| i > pos) {
-                governing = Some((i, if is_fv { "fv" } else { "cost" }));
+                governing = Some((i, model));
             }
         }
     }
-    if let Some((_, kind)) = governing {
-        return if kind == "cost" {
-            "cost model".to_string()
-        } else {
-            "fair value model".to_string()
-        };
+    if let Some((_, model)) = governing {
+        return model.to_string();
     }
 
     // Jendela ~260 char setelah penanda pengukuran lanjutan: di situlah model
@@ -1509,8 +1503,6 @@ mod pdf_extract {
         // identitas di atas, jadi urutan dokumen kembali bermakna.
         // ponytail: mengandalkan urutan dokumen (tahun berjalan dulu). Kalau ada
         // emiten yang membalik urutan, jalur vision (Fase 3-5) yang cross-check.
-        let mut best: Option<(i64, i64, f64)> = None;
-
         for i in 0..n {
             // baris total/manajemen bukan baris pemegang publik
             if !inline_row(lines[i]) || re_manager.is_match(lines[i]) || re_total.is_match(lines[i])
@@ -1544,12 +1536,12 @@ mod pdf_extract {
             let xcheck_ok = total_shares > 0
                 && (100.0 * public_shares as f64 / total_shares as f64 - free_float).abs() <= 0.5;
 
-            if total_ok && xcheck_ok && best.is_none() {
-                best = Some((public_shares, total_shares, free_float));
+            if total_ok && xcheck_ok {
+                return Some((public_shares, total_shares, free_float));
             }
         }
 
-        best
+        None
     }
 }
 

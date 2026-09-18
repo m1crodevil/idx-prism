@@ -34,7 +34,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 1. **XBRL Fact Streaming**: Parses financial statement elements and firm-level control variables without memory bloat.
 2. **CALK Disclosure Extraction**: Context-aware regex parser anchored to specific disclosure notes (e.g. investment properties under PSAK 13 / IAS 40), extracting verbatim fair value amounts, independent appraisal firms (KJPP), appraisal dates, and asset compositions.
 3. **Market Microstructure & Information Asymmetry**: Computes peer-reviewed econometric proxies (**Corwin-Schultz 2012 spread**, **Zero-Return-Days**, **volatility**, **turnover**) directly from daily OHLCV series.
-4. **Share Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and total outstanding — validated by an internal cross-check; unmatched layouts return `null` for manual coding.
+4. **Share Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. Page text is rebuilt as visual rows (grouped from word bounding boxes) so bilingual, multi-column tables read as a human sees them, then two gates must pass — **row identity** (the row's own label must be the public holder; management and Total rows are excluded) and **self-consistency** (`public/total == free-float%`). Failing either returns `null` rather than a silently wrong number.
 5. **Universe & Sampling Tools**: Queries and exports official IDX-IC sector listings with purposive filtering options.
 
 ---
@@ -65,7 +65,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 * **Intelligent Accounting Policy Resolution**: Reads the first non-empty `InvestmentProperty(ies)TextBlock` in document order, so the substantive policy wins over a cross-reference placeholder (some issuers emit only `"Idem row 10"` in one block while the real narrative sits in the other). When every XBRL block is empty or `nil`, it falls back to the policy narrative from the audited PDF CALK text layer.
 * **Standardized Control Variables**: Automatically maps `Assets`, `Liabilities`, `Equity`, `SalesAndRevenue`, and `ProfitLoss` to current-period instants and durations.
 * **Econometric Spread Estimation**: Computes the gold-standard Corwin & Schultz (2012) two-day high-low bid-ask spread estimator, plus Zero-Return-Days and daily-return volatility, to quantify information asymmetry without requiring proprietary intraday tick data.
-* **Share-Ownership Extraction**: Parses the CALK *Modal Saham* note (row-major layout) to recover public/free-float shares, percentage, and shares outstanding — gated by a self-consistency cross-check (`public/total == free-float%`) so mismatched layouts yield `null` instead of a silently wrong number.
+* **Share-Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. A self-consistency gate alone is insufficient — every row satisfies `public/total == printed percent`, including a director's line — so it is paired with a row-identity gate. Either gate failing yields `null`.
 * **Sanitized & Portable**: Zero hardcoded local machine paths; configurable via environment variables (`IDXPRISM_DATA`, `IDXPRISM_BIN`).
 
 ---
@@ -86,7 +86,7 @@ The compiled binary will be available at `./target/release/idx-prism`.
 
 ### Verify the Build
 ```bash
-cargo test                        # unit tests
+cargo test                        # unit tests (includes a sanitization gate)
 ./scripts/smoke_test.sh           # end-to-end exercise of every subcommand on local data
 ```
 `smoke_test.sh` reads issuer data from `$IDXPRISM_DATA` (default `~/.idxlens/data`) and skips emiten whose files are absent.
@@ -133,7 +133,9 @@ idx-prism <TICKER> -f <path/to/instance.zip> -y <year> [--pdf <path/to/report.pd
 }
 ```
 
-> **Share ownership** (`free_float_pct`, `public_shares`, `shares_outstanding`) is added to the JSON when the CALK *Modal Saham* table extracts in row-major form and passes the internal cross-check — e.g. PWON 2023 yields `31.3 / 15070264960 / 48159602400`. Split-layout tables (e.g. CTRA, SMRA) are omitted (`null`) rather than guessed, and should be coded manually. For an authoritative figure, the monthly **LBRPE** ("Laporan Bulanan Registrasi Pemegang Efek", field *"% Saham Free Float"*) reflects the official BEI Regulation I-A definition (excluding treasury, lock-up, controllers, and directors) and can validate this proxy.
+> **Share ownership** (`free_float_pct`, `public_shares`, `shares_outstanding`) is added to the JSON when the CALK *Modal Saham* table passes both gates. Verified end-to-end on six issuers: PWON 2023 `31.30`, BSDE 2023 `28.94`, **CTRA 2023 `46.60`**, SMRA 2023 `64.54`, APLN 2024 `12.26`, DILD 2024 `36.55`. Labels differ per issuer ("Masyarakat", "Masyarakat umum", "Lain-lain (masing-masing dengan pemilikan kurang dari 5%)", "Public"), so the parser anchors on where the label sits within its row, not on a fixed phrase.
+>
+> **Choosing the PDF matters more than choosing the parser.** A single filing ships several PDFs, and the one that *mentions* the note most often is not the one that parses — for APLN 2024 the 8.5 MB annual report contains 89 occurrences of "masyarakat" and yields nothing, while the 863 KB audited-statements PDF contains 3 and yields the correct `12.26`. Select by *outcome*: try each candidate and keep the one that produces a value, then use agreement between documents as verification. Measured on 73 emiten-years: 53 (73%) yield a value from at least one document, 50 of those agree across documents, and 3 disagree — one materially (BSDE 2023: `28.94` vs `33.91`, a different reporting period in the same filing), two by rounding (`68.93` vs `68.94`; `2.20` vs `2.25`). For an authoritative figure, the monthly **LBRPE** ("Laporan Bulanan Registrasi Pemegang Efek", field *"% Saham Free Float"*) reflects the official BEI Regulation I-A definition (excluding treasury, lock-up, controllers, and directors) and can validate this proxy.
 
 ---
 
@@ -214,7 +216,9 @@ Consolidate all downloaded reports into a unified panel CSV in seconds:
 ./scripts/batch_extract.sh dataset_properti_panel.csv
 ```
 
-**Output columns:** ticker, year, accounting model, investment property amounts, control variables (assets/liabilities/equity/revenue/net income), fair value disclosure flag, appraiser names, and free-float ownership proxy (`free_float_pct`, `public_shares`, `shares_outstanding`) where the CALK layout permits. Split-layout tables yield `null` for ownership fields.
+**Output columns:** ticker, year, accounting model, investment property amounts, control variables (assets/liabilities/equity/revenue/net income), fair value disclosure flag, appraiser names, and free-float ownership proxy (`free_float_pct`, `public_shares`, `shares_outstanding`). Ownership fields are `null` when either gate fails.
+
+**`accounting_model` values:** `cost model`, `fair value model`, `revaluation model`, or `unknown`. Classification reads the *measurement sentence* — the one stating how the property is measured **after initial recognition** — rather than mere keyword presence, because every fair-value issuer also writes "at cost on initial recognition", and a keyword match misclassifies them as cost model.
 
 ---
 
