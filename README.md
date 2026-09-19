@@ -4,7 +4,7 @@
 
 **High-Performance Pipeline for Financial Disclosure Extraction & Market Microstructure Analytics on the Indonesia Stock Exchange (IDX / BEI)**
 
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
@@ -74,7 +74,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 ## Installation
 
 ### Prerequisites
-* [Rust Toolchain](https://www.rust-lang.org/tools/install) (version 1.75 or later)
+* [Rust Toolchain](https://www.rust-lang.org/tools/install) (version 1.89 or later — enforced by `rust-version` in `Cargo.toml`)
 
 ### Build from Source
 ```bash

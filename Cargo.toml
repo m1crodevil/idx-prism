@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "High-performance pipeline for parsing IDX financial disclosures and computing market microstructure metrics"
 license = "MIT"
+# Prose drifts; this does not. A dependency (aes) sets the true floor at 1.89,
+# measured by building against 1.87 (fails) and 1.89 (passes). Declaring it here
+# makes cargo refuse an older toolchain with a clear message instead of leaving a
+# stale badge to mislead. Bump only after measuring the same way.
+rust-version = "1.89"
 
 [features]
 default = []
