@@ -1803,6 +1803,7 @@ fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut rows = vec![BATCH_HEADER.to_string()];
     let mut failures: Vec<String> = Vec::new();
     let mut no_readable_pdf = 0usize;
+    let mut selected = 0usize;
 
     for (ticker, year, zip) in &instances {
         let data = match fs::read(zip) {
@@ -1856,6 +1857,9 @@ fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         if !candidates.is_empty() && chosen.is_none() {
             no_readable_pdf += 1;
+        }
+        if chosen.is_some() {
+            selected += 1;
         }
 
         let pdf_file = chosen
@@ -1915,10 +1919,15 @@ fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
         None => print!("{}", out),
     }
 
+    // Count what the label says. `instances.len() - failures.len()` is the
+    // number of filings whose XBRL parsed, which is NOT the number that got a
+    // readable PDF — a filing can parse fine and still select no document.
+    // Reporting the former under the latter's name is the same defect as a
+    // driver reporting "44 missing" when 15 were.
     eprintln!(
-        "[batch] {} filings, {} readable-PDF selections, {} had no readable PDF",
+        "[batch] {} filings, {} with a readable PDF, {} had none readable",
         instances.len(),
-        instances.len() - failures.len(),
+        selected,
         no_readable_pdf
     );
     if !failures.is_empty() {
