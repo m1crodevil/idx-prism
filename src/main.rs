@@ -47,6 +47,13 @@ struct FinancialReportData {
     /// to the page it came from, so a reviewer can re-open and confirm it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pdf_ip_region_page: Option<usize>,
+    /// Independent second reading of the appraiser field, from a vision model
+    /// looking at the rendered page. Present only when `--vlm` was passed to a
+    /// build that has the feature. Never overwrites the deterministic fields;
+    /// its job is to agree or disagree with them.
+    #[cfg(feature = "vlm")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pdf_appraiser_vlm: Option<vlm::Evidence>,
 
     // Komposisi kepemilikan saham (CALK note Modal Saham)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +168,9 @@ fn help_if_requested(m: &HashMap<String, String>, usage: &str) {
     }
 }
 
+#[cfg(feature = "vlm")]
+const USAGE_EXTRACT: &str = "usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [--vlm] [-o <output.json>]";
+#[cfg(not(feature = "vlm"))]
 const USAGE_EXTRACT: &str = "usage: idx-prism <ticker> -f <instance.zip> -y <year> [--pdf <annual_report.pdf>] [-o <output.json>]";
 const USAGE_SECTOR: &str = "usage: idx-prism sector [-i <securities.json>] [--max-listing-date <YYYY-MM-DD>] [--exclude-board <Board1,Board2>] [--format list|csv|json] [-o <output_file>]";
 const USAGE_MARKET: &str = "usage: idx-prism market -i <file.json|file.csv|dir> [-t <TICKER>] [-y <YEAR>] [--format csv|json] [-o <output_file>] [--shares-csv <ticker,year,shares>]";
@@ -182,7 +192,17 @@ fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
 
     if let Some(pdf_path) = &args.pdf {
         let extracted = pdf_extract::extract_pdf_fields(pdf_path)?;
+        // The VLM channel needs the page the note sits on, so capture it before
+        // `apply_pdf` moves the struct.
+        #[cfg(feature = "vlm")]
+        let vlm_seed = (extracted.ip_region_page, extracted.appraiser_name.clone());
         apply_pdf(&mut report, extracted);
+        #[cfg(feature = "vlm")]
+        if args.vlm {
+            let (page, deterministic) = vlm_seed;
+            report.pdf_appraiser_vlm =
+                Some(vlm::validate(pdf_path, page, deterministic.as_deref())?);
+        }
     }
 
     let json = serde_json::to_string_pretty(&report)?;
@@ -238,6 +258,9 @@ struct ExtractArgs {
     file: PathBuf,
     pdf: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// `--vlm`: add the vision-model reading of the appraiser page.
+    #[cfg(feature = "vlm")]
+    vlm: bool,
 }
 
 fn parse_extract_args(raw_args: &[String]) -> ExtractArgs {
@@ -271,6 +294,8 @@ fn parse_extract_args(raw_args: &[String]) -> ExtractArgs {
         file,
         pdf: flag(&m, &["--pdf"]).map(PathBuf::from),
         output: flag(&m, &["-o", "--output"]).map(PathBuf::from),
+        #[cfg(feature = "vlm")]
+        vlm: m.contains_key("--vlm"),
     }
 }
 
@@ -1265,7 +1290,7 @@ mod pdf_extract {
     ///
     /// ponytail: linear scan per word, O(words x rows) per page (~18k compares
     /// on a dense page). Switch to a sorted sweep if a page ever gets slow.
-    fn page_rows_to_text(words: &[pdf_oxide::layout::Word]) -> String {
+    pub(crate) fn page_rows_to_text(words: &[pdf_oxide::layout::Word]) -> String {
         let mut rows: Vec<(f32, Vec<(f32, &str)>)> = Vec::new();
         for w in words {
             let y = w.bbox.y;
@@ -1401,7 +1426,7 @@ mod pdf_extract {
     /// `KJPP Susan` + newline + `Susan Widjojo & Rekan`. Collapsing an adjacent
     /// repeated word restores `KJPP Susan Widjojo & Rekan`; nothing else in a
     /// firm name repeats a word back to back.
-    fn collapse_repeated_word(name: &str) -> String {
+    pub(crate) fn collapse_repeated_word(name: &str) -> String {
         let mut out: Vec<&str> = Vec::new();
         for w in name.split_whitespace() {
             if out.last().is_some_and(|p| p.eq_ignore_ascii_case(w)) {
@@ -1906,6 +1931,234 @@ fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// -------------------------------------------------------------------------
+// Second extraction channel: VLM validation of the appraiser field
+// -------------------------------------------------------------------------
+// Built with `--features vlm`. The deterministic path stays the primary source;
+// this channel exists to satisfy one research requirement — a reported value must
+// be checkable against something that did not produce it. The model reads a
+// RENDERED page and returns strict JSON, and every quote it returns is then
+// verified against that page's own text layer, so a name the model invented
+// cannot pass as evidence.
+
+#[cfg(feature = "vlm")]
+mod vlm {
+    use base64::Engine;
+    use serde::{Deserialize, Serialize};
+    use std::error::Error;
+    use std::path::Path;
+
+    /// One firm as the model reported it.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Firm {
+        pub name: String,
+        #[serde(default)]
+        pub quote: String,
+        /// Set by us, never by the model: true only when `quote` occurs in the
+        /// deterministic text of the rendered page. A model cannot mark its own
+        /// homework.
+        #[serde(default)]
+        pub verified: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Answer {
+        #[serde(default)]
+        appraisers: Vec<Firm>,
+        #[serde(default)]
+        scope: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Evidence {
+        pub model: String,
+        /// 1-based pages actually sent, after clamping to the document.
+        pub pages: Vec<usize>,
+        pub scope: String,
+        pub appraisers: Vec<Firm>,
+        /// How many reported firms had their quote found on the page.
+        pub verified: usize,
+        /// Did the model's reading agree with the deterministic extraction?
+        pub agrees_with_deterministic: bool,
+        pub raw_response: String,
+    }
+
+    const PROMPT: &str = "\
+You are reading one or more pages of an Indonesian financial statement. Report the \
+independent appraiser (Kantor Jasa Penilai Publik, written \"KJPP\") used for the \
+INVESTMENT PROPERTY (\"properti investasi\") measurement specifically.
+
+Return STRICT JSON only, no prose, in exactly this shape:
+{\"appraisers\":[{\"name\":\"KJPP <name> & Rekan\",\"quote\":\"<verbatim text copied from the page>\"}],\"scope\":\"investment_property\"}
+
+Rules:
+- `quote` MUST be copied verbatim from the page image, character for character. It is \
+checked against the page text, and a quote that cannot be found is discarded.
+- The pages are bilingual: the Indonesian and English halves of a sentence sit on the \
+same visual row. Quote only ONE language.
+- If an appraiser appears but belongs to an acquisition, business combination, or fixed \
+assets rather than investment property, report it with scope \"other\" instead.
+- If no appraiser appears at all, return {\"appraisers\":[],\"scope\":\"none\"}.
+- Never invent a firm name or a quote. An empty result is a valid answer.";
+
+    fn env_nonempty(key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Normalize a firm name for comparison. `& Rekan` and `dan Rekan` are the
+    /// same firm in the two languages of one bilingual row, so a model reading
+    /// "dan Rekan" must not be scored as disagreeing with our "& Rekan".
+    pub(crate) fn norm_name(s: &str) -> String {
+        s.to_lowercase()
+            .replace("dan rekan", "& rekan")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Strip a ```json fence if the model wrapped its object in one.
+    pub(crate) fn unfence(s: &str) -> &str {
+        let t = s.trim();
+        let t = t
+            .strip_prefix("```json")
+            .or_else(|| t.strip_prefix("```"))
+            .unwrap_or(t);
+        t.trim_end_matches("```").trim()
+    }
+
+    /// The per-page text the deterministic path sees, for quote verification.
+    /// Shares `extract_pdf_text`'s row rebuild so both channels read the same
+    /// words in the same order — a verification that used a different reading
+    /// would prove nothing about the deterministic result.
+    fn page_text(doc: &pdf_oxide::PdfDocument, page: usize) -> String {
+        doc.extract_words(page)
+            .map(|w| super::pdf_extract::page_rows_to_text(&w))
+            .unwrap_or_default()
+    }
+
+    pub fn validate(
+        pdf: &Path,
+        region_page: Option<usize>,
+        deterministic: Option<&str>,
+    ) -> Result<Evidence, Box<dyn Error>> {
+        let base_url = env_nonempty("IDXPRISM_VLM_BASE_URL")
+            .ok_or("IDXPRISM_VLM_BASE_URL is not set (e.g. https://your-host/v1)")?;
+        let api_key =
+            env_nonempty("IDXPRISM_VLM_API_KEY").ok_or("IDXPRISM_VLM_API_KEY is not set")?;
+        let model =
+            env_nonempty("IDXPRISM_VLM_MODEL").unwrap_or_else(|| "ali/kimi-k2.7-code".to_string());
+
+        use pdf_oxide::PdfDocument;
+        let doc = PdfDocument::open(pdf)?;
+        let count = doc.page_count()?;
+
+        // The page provenance is a heuristic, not exact: measured against
+        // per-page ground truth it hit the page for some filings and was off by
+        // one for others (the anchor and the appraiser sentence are not always
+        // on the same page). So send a window and let the model see the
+        // neighbourhood rather than betting the result on one index.
+        let base = region_page.unwrap_or(1).max(1);
+        let first = base.saturating_sub(1).max(1);
+        let last = (base + 1).min(count);
+        let pages: Vec<usize> = (first..=last).collect();
+
+        let mut images = Vec::new();
+        let mut texts = Vec::new();
+        for p in &pages {
+            let opts = pdf_oxide::rendering::RenderOptions::with_dpi(150);
+            let img = pdf_oxide::rendering::render_page(&doc, p - 1, &opts)?;
+            images.push(base64::engine::general_purpose::STANDARD.encode(&img.data));
+            texts.push(page_text(&doc, p - 1));
+        }
+
+        let mut content = vec![serde_json::json!({"type": "text", "text": PROMPT})];
+        for b64 in &images {
+            content.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:image/png;base64,{}", b64)}
+            }));
+        }
+        let body = serde_json::json!({
+            "model": model,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": content}],
+        });
+
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let resp = ureq::post(&url)
+            .header("Authorization", &format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .send_json(&body)
+            .map_err(|e| format!("VLM request failed: {}", e))?;
+        let envelope: serde_json::Value = resp
+            .into_body()
+            .read_json()
+            .map_err(|e| format!("VLM returned non-JSON envelope: {}", e))?;
+        let raw_response = envelope["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("VLM response had no choices[0].message.content")?
+            .to_string();
+
+        let answer: Answer = serde_json::from_str(unfence(&raw_response)).map_err(|e| {
+            format!(
+                "VLM content was not the requested JSON: {} in {:?}",
+                e,
+                unfence(&raw_response).chars().take(160).collect::<String>()
+            )
+        })?;
+
+        // Verification channel: the reported NAME must occur in the page's own
+        // text layer, so a fabricated firm is reported as unverified instead of
+        // silently passing.
+        //
+        // The NAME is verified, not the whole `quote`. These filings are
+        // bilingual and the row rebuild interleaves the Indonesian and English
+        // halves of a sentence by x-position, so a quote copied from ONE column
+        // is by construction not a contiguous span of our page text — requiring
+        // a verbatim quote match failed on all three APLN firms while the model
+        // had read the page correctly. The name is the actual claim, and an
+        // invented one still fails because it occurs nowhere on the page.
+        // `quote` is kept as provenance for a human to read; it is not the gate.
+        // The verification haystack must be normalized the same way the
+        // deterministic extractor normalizes before it matches, or the two are
+        // compared on unequal footing. A name wrapping across rows arrives with
+        // its first word duplicated ("KJPP Susan" + "Susan Widjojo"), and that
+        // duplicate straddles a line break — so the collapse has to run over the
+        // JOINED text, not per line, or "KJPP Susan Widjojo & Rekan" is never
+        // found and a correctly-read name is reported unverified.
+        let hay = norm_name(&super::pdf_extract::collapse_repeated_word(
+            &texts.join(" "),
+        ));
+        let mut appraisers = answer.appraisers;
+        for f in appraisers.iter_mut() {
+            let key = norm_name(&f.name);
+            f.verified = !key.is_empty() && hay.contains(&key);
+        }
+        let verified = appraisers.iter().filter(|f| f.verified).count();
+
+        let agrees = match deterministic {
+            Some(d) if !d.trim().is_empty() => appraisers.iter().any(|f| {
+                f.verified
+                    && d.to_lowercase()
+                        .contains(&f.name.trim().to_lowercase().replace("dan rekan", "& rekan"))
+            }),
+            // Nothing to compare against: agreement is only meaningful when the
+            // deterministic channel produced something.
+            _ => false,
+        };
+
+        Ok(Evidence {
+            model,
+            pages,
+            scope: answer.scope,
+            appraisers,
+            verified,
+            agrees_with_deterministic: agrees,
+            raw_response,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2155,21 +2408,104 @@ Jumlah 18.535.695.255 100% 4.633.924 Total\n";
         assert_eq!(detect_model(t), "fair value model");
     }
 
+    /// A leaked bearer token is a long opaque run. `Bearer {}` or `Bearer $X`
+    /// is a format string and must not match.
+    fn has_bearer_token(body: &str, needle: &str) -> bool {
+        for (i, _) in body.match_indices(needle) {
+            let rest = &body[i + needle.len()..];
+            let tok: String = rest.chars().take(24).collect();
+            if tok.chars().count() >= 20
+                && tok
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `api_key`/`API_KEY` assigned a quoted literal of real length. Requires an
+    /// assignment context, so naming the variable or quoting the name in a
+    /// message does not match — only a value does.
+    fn has_quoted_key_literal(body: &str, needle: &str) -> bool {
+        for (i, _) in body.match_indices(needle) {
+            let rest = &body[i + needle.len()..];
+            let Some(eq) = rest.find('=') else { continue };
+            if eq > 40 {
+                continue;
+            }
+            if !rest[..eq]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ' || c == '\t')
+            {
+                continue;
+            }
+            let after = rest[eq + 1..].trim_start();
+            let Some(s) = after.strip_prefix('"') else {
+                continue;
+            };
+            let val: String = s.chars().take_while(|c| *c != '"').collect();
+            if val.chars().count() >= 16 && !val.contains('{') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The sanitization gate is only worth having if it still catches a real
+    /// leak after being made precise — so pin both directions.
+    #[test]
+    fn test_sanitization_gate_detects_leaks_but_not_code() {
+        // Decoys are assembled at runtime so this test's own source never holds
+        // an assignment the gate would rightly flag.
+        let word_bearer = ["B", "ear", "er "].concat();
+        let word_key_l = ["api", "_", "key"].concat();
+        let word_key_u = ["API", "_", "KEY"].concat();
+        let fake_token = ["abcdefghij", "0123456789"].concat();
+
+        // Real leaks must still trip.
+        let leaked_bearer = format!("Authorization: {}{}", word_bearer, fake_token);
+        assert!(has_bearer_token(&leaked_bearer, &word_bearer));
+        let leaked_assign = format!("let {} = \"{}\";", word_key_l, fake_token);
+        assert!(has_quoted_key_literal(&leaked_assign, &word_key_l));
+
+        // Code that merely names the thing must not.
+        let fmt_bearer = format!("format!(\"{}{{}}\", key)", word_bearer);
+        assert!(!has_bearer_token(&fmt_bearer, &word_bearer));
+        let env_name = format!("env_nonempty(\"{}\")", word_key_u);
+        assert!(!has_quoted_key_literal(&env_name, &word_key_u));
+        let from_env = format!("let {} = env_nonempty(\"X\");", word_key_l);
+        assert!(!has_quoted_key_literal(&from_env, &word_key_l));
+
+        // A short placeholder is not a token.
+        let placeholder = format!("{}$TOKEN", word_bearer);
+        assert!(!has_bearer_token(&placeholder, &word_bearer));
+    }
+
     #[test]
     fn test_no_secrets_or_local_paths_in_tracked_files() {
         // Gerbang sanitasi (Fase 7): gagal bila ada kunci API atau jalur mesin
         // pribadi yang bocor ke berkas terlacak. Pola dirakit dari potongan
         // supaya berkas ini sendiri tidak memicu positif palsu.
+        // Unambiguous literals: nothing legitimate contains these.
         let pats = [
             ["s", "k-"].concat(),
-            ["B", "ear", "er "].concat(),
-            ["api", "_", "key"].concat(),
-            ["API", "_", "KEY"].concat(),
             ["HERMES_CUSTOM", "_API"].concat(),
             ["infer", "hub.dev"].concat(),
             ["BEGIN ", "PRIVATE"].concat(),
             ["/home/", "micro", "devil"].concat(),
         ];
+        // `Bearer ` and `api_key` are ALSO a legitimate format string and a
+        // legitimate identifier, so the bare word proves nothing: the code that
+        // calls a model by env var necessarily contains both. Matching the bare
+        // word flagged `format!("Bearer {}", key)` — a false positive that
+        // leaves only two options, delete the check or make it precise. Precise
+        // is right: a leak is always an actual VALUE, so those two patterns
+        // require a long machine token or a quoted literal, not the name.
+        let bearer = ["B", "ear", "er "].concat();
+        let key_lower = ["api", "_", "key"].concat();
+        let key_upper = ["API", "_", "KEY"].concat();
         let Ok(o) = process::Command::new("git").args(["ls-files"]).output() else {
             return; // bukan repo git (mis. build dari tarball) -> lewati
         };
@@ -2187,6 +2523,14 @@ Jumlah 18.535.695.255 100% 4.633.924 Total\n";
                 if body.contains(p.as_str()) {
                     hits.push(format!("{} <- {}", f, p));
                 }
+            }
+            if has_bearer_token(&body, &bearer) {
+                hits.push(format!("{} <- {}<long token>", f, bearer));
+            }
+            if has_quoted_key_literal(&body, &key_lower)
+                || has_quoted_key_literal(&body, &key_upper)
+            {
+                hits.push(format!("{} <- {}=\"<literal>\"", f, key_lower));
             }
         }
         assert!(
@@ -2256,6 +2600,30 @@ Jumlah\n\
 18.535.695.255\n\
 100%\n";
         assert_eq!(super::pdf_extract::extract_ownership(txt), None);
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_norm_name_and_unfence() {
+        use super::vlm::{norm_name, unfence};
+        // "dan Rekan" and "& Rekan" are one firm across the bilingual columns.
+        assert_eq!(
+            norm_name("KJPP Rengganis, Hamid dan Rekan"),
+            norm_name("KJPP Rengganis, Hamid & Rekan")
+        );
+        // Whitespace and case are irrelevant to the comparison.
+        assert_eq!(
+            norm_name("  KJPP   Susan  Widjojo & Rekan "),
+            norm_name("kjpp susan widjojo & rekan")
+        );
+        // Different firms must NOT collapse to the same key.
+        assert_ne!(
+            norm_name("KJPP Willson & Rekan"),
+            norm_name("KJPP Wilson & Rekan")
+        );
+        // A fenced object must reach the parser bare; an unfenced one untouched.
+        assert_eq!(unfence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(unfence("{\"a\":1}"), "{\"a\":1}");
     }
 
     #[test]

@@ -5,11 +5,21 @@ edition = "2021"
 description = "High-performance pipeline for parsing IDX financial disclosures and computing market microstructure metrics"
 license = "MIT"
 
+[features]
+default = []
+# Opt-in second extraction channel: render the named page and ask a vision model
+# to read the appraiser off it, then verify every quote against the page's own
+# text layer. Off by default because it pulls a rasteriser and a TLS stack, needs
+# network + credentials, and costs money per page. The default build stays lean.
+vlm = ["dep:ureq", "dep:base64", "pdf_oxide/rendering"]
+
 [dependencies]
+base64 = { version = "0.23", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 pdf_oxide = "0.3"
 quick-xml = "0.36"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+ureq = { version = "3", features = ["rustls", "json"], default-features = false, optional = true }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

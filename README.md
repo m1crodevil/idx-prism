@@ -32,7 +32,7 @@ Analyzing Indonesian public firms typically requires labor-intensive manual retr
 
 IDX-Prism consolidates these workflows into a single autonomous engine:
 1. **XBRL Fact Streaming**: Parses financial statement elements and firm-level control variables without memory bloat.
-2. **CALK Disclosure Extraction**: Context-aware regex parser anchored to specific disclosure notes (e.g. investment properties under PSAK 13 / IAS 40), extracting verbatim fair value amounts, independent appraisal firms (KJPP), appraisal dates, and asset compositions. Bilingual filings print the Indonesian and English halves of a sentence on the *same* visual row, so the row merge can carry a firm name across a column boundary (`KJPP independen KJPP Willson & Rekan`). A firm name is `KJPP <people> & Rekan` and never contains the acronym twice, so the match is trimmed to its **last** `KJPP` — that yields the true name instead of the English prose bleeding in. Rust's `regex` crate has no look-around by design, so this filter runs in code rather than in the pattern. Names are cut to the investment-property note only: an appraiser quoted for an acquisition or a business combination must not be reported as the investment-property appraiser.
+2. **CALK Disclosure Extraction**: Context-aware regex parser anchored to specific disclosure notes (e.g. investment properties under PSAK 13 / IAS 40), extracting verbatim fair value amounts, independent appraisal firms (KJPP), appraisal dates, and asset compositions. Bilingual filings print the Indonesian and English halves of a sentence on the *same* visual row, so the row merge can carry a firm name across a column boundary (`KJPP independen KJPP Willson & Rekan`). A firm name is `KJPP <people> & Rekan` and never contains the acronym twice, so the match is trimmed to its **last** `KJPP` — that yields the true name instead of the English prose bleeding in. Rust's `regex` crate has no look-around by design, so this filter runs in code rather than in the pattern. Names are cut to the investment-property note only: an appraiser quoted for an acquisition or a business combination must not be reported as the investment-property appraiser. A second, independent reading of the same field can be requested from a vision model (`--vlm`), which reports its own answer and whether it agrees.
 3. **Market Microstructure & Information Asymmetry**: Computes peer-reviewed econometric proxies (**Corwin-Schultz 2012 spread**, **Zero-Return-Days**, **volatility**, **turnover**) directly from daily OHLCV series.
 4. **Share Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. Page text is rebuilt as visual rows (grouped from word bounding boxes) so bilingual, multi-column tables read as a human sees them, then two gates must pass — **row identity** (the row's own label must be the public holder; management and Total rows are excluded) and **self-consistency** (`public/total == free-float%`). Failing either returns `null` rather than a silently wrong number.
 5. **Universe & Sampling Tools**: Queries and exports official IDX-IC sector listings with purposive filtering options.
@@ -80,7 +80,8 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 ```bash
 git clone https://github.com/m1crodevil/idx-prism.git
 cd idx-prism
-cargo build --release
+cargo build --release                 # deterministic pipeline (no network, no credentials)
+cargo build --release --features vlm  # + the vision validation channel (see below)
 ```
 
 The compiled binary will be available at `./target/release/idx-prism`.
@@ -88,6 +89,7 @@ The compiled binary will be available at `./target/release/idx-prism`.
 ### Verify the Build
 ```bash
 cargo test                        # unit tests (includes a sanitization gate)
+cargo test --features vlm         # + the vision channel's own tests
 ./scripts/smoke_test.sh           # end-to-end exercise of every subcommand on local data
 ```
 `smoke_test.sh` reads issuer data from `$IDXPRISM_DATA` (default `~/.idxlens/data`) and skips emiten whose files are absent.
@@ -224,6 +226,27 @@ Filings that cannot be extracted are reported on stderr and the process exits no
 **Output columns:** ticker, year, accounting model, investment property amounts, control variables (assets/liabilities/equity/revenue/net income), fair value disclosure flag, appraiser names, free-float ownership proxy (`free_float_pct`, `public_shares`, `shares_outstanding`), the source document (`pdf_file`), and a disagreement flag (`review_required`). Ownership fields are empty when either gate fails.
 
 **`accounting_model` values:** `cost model`, `fair value model`, `revaluation model`, or `unknown`. Classification reads the *measurement sentence* — the one stating how the property is measured **after initial recognition** — rather than mere keyword presence, because every fair-value issuer also writes "at cost on initial recognition", and a keyword match misclassifies them as cost model.
+
+### 5. Vision Validation Channel (`--vlm`)
+
+An opt-in **second reading** of the appraiser field by a vision model looking at the rendered page. It exists to satisfy one research requirement: a reported value must be checkable against something that did not produce it. It never overwrites the deterministic fields — it agrees or disagrees with them.
+
+```bash
+cargo build --release --features vlm
+export IDXPRISM_VLM_BASE_URL="https://<your-openai-compatible-host>/v1"
+export IDXPRISM_VLM_API_KEY="..."          # read from the environment, never stored
+export IDXPRISM_VLM_MODEL="ali/kimi-k2.7-code"   # optional, this is the default
+
+idx-prism CTRA -f instance.zip -y 2024 --pdf lapkeu.pdf --vlm
+```
+
+Three design choices worth knowing:
+
+* **A window of pages is rendered, not one.** The page provenance (`pdf_ip_region_page`) is a heuristic: measured against per-page ground truth it hit the page exactly for some filings and was off by one for others, because the note anchor and the appraiser sentence do not always share a page. The rendered window is `page-1 .. page+1`, so one wrong index cannot decide the result.
+* **The model's NAME is verified against the page's own text layer, not its quote.** Filings are bilingual and the row rebuild interleaves the Indonesian and English halves of a sentence by x-position, so a quote copied from *one* column is by construction not a contiguous span of our page text — requiring a verbatim quote match failed on every firm while the model had read the page correctly. The name is the actual claim, and an invented one still fails, because it occurs nowhere on the page. Each firm is reported with `verified: true|false`.
+* **`scope` is reported, not assumed.** The model distinguishes an appraiser used for investment property from one quoted for an acquisition, a business combination, or fixed assets. That distinction matters: an issuer can name a different firm for each.
+
+The channel costs one request per filing, so it is intended for the subset that needs corroboration, not the whole corpus. It is behind a Cargo feature because it pulls a rasteriser and a TLS stack that the deterministic pipeline does not need.
 
 ---
 
