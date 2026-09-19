@@ -1395,18 +1395,64 @@ mod pdf_extract {
         None
     }
 
-    fn extract_appraiser_name(text: &str) -> Option<String> {
+    /// Rebuild a name, collapsing a word that the two-column merge duplicated.
+    /// Bilingual filings put the Indonesian and English halves of a sentence on
+    /// the same visual row, so a firm name that wraps looks like
+    /// `KJPP Susan` + newline + `Susan Widjojo & Rekan`. Collapsing an adjacent
+    /// repeated word restores `KJPP Susan Widjojo & Rekan`; nothing else in a
+    /// firm name repeats a word back to back.
+    fn collapse_repeated_word(name: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        for w in name.split_whitespace() {
+            if out.last().is_some_and(|p| p.eq_ignore_ascii_case(w)) {
+                continue;
+            }
+            out.push(w);
+        }
+        out.join(" ")
+    }
+
+    pub(crate) fn extract_appraiser_name(text: &str) -> Option<String> {
+        // Bilingual two-column filings put the ID and EN halves of a sentence on
+        // the SAME visual row, and `page_rows_to_text` merges them. The 60-char
+        // name window can then start at one "KJPP" and reach a "Rekan" in the
+        // other column, swallowing the English prose in between:
+        //   "…penilaian oleh KJPP Jimmy Prasetyo & Rekan, KJPP | been assessed
+        //    by KJPP Jimmy Prasetyo & Rekan, KJPP Susan"
+        // -> "KJPP been assessed by KJPP Jimmy Prasetyo & Rekan"
+        //
+        // The real fix is "a name that does not itself contain KJPP", which
+        // needs look-around — and Rust's `regex` crate has none by design (RE2,
+        // linear time; BurntSushi: "you either need to stop using look-around,
+        // or use a different regex engine"). Borrowing regex from a
+        // backtracking engine (fancy-regex) for one filter is not worth it, so
+        // follow the crate's own guidance: match the broad shape, filter after.
         let re_kjpp = Regex::new(
             r"(?i)(KJPP\s+[A-Za-z0-9\s&,–-]{3,60}?(?:Rekan|\(Rengganis\)|\(Putri\)|dan Rekan|& Rekan))",
         )
         .ok()?;
-        let mut appraisers = Vec::new();
+        let re_kjpp_anchor = Regex::new(r"(?i)KJPP").ok()?;
+        let mut appraisers: Vec<String> = Vec::new();
         for caps in re_kjpp.captures_iter(text) {
-            if let Some(m) = caps.get(1) {
-                let name = m.as_str().replace('\n', " ").trim().to_string();
-                if !appraisers.contains(&name) {
-                    appraisers.push(name);
-                }
+            let Some(m) = caps.get(1) else { continue };
+            let raw = m.as_str();
+            // A firm name is `KJPP <people> & Rekan` and never contains the
+            // acronym twice, so when the match spans two `KJPP` the LAST one
+            // begins the true name: "KJPP independen KJPP Willson & Rekan" ->
+            // "KJPP Willson & Rekan". Trimming rather than discarding matters
+            // because `captures_iter` never re-scans inside a consumed match,
+            // so dropping it would lose the name outright.
+            let Some(anchor) = re_kjpp_anchor.find_iter(raw).last() else {
+                continue;
+            };
+            let name = collapse_repeated_word(&raw[anchor.start()..]);
+            // Dedupe on a normalized key, not the raw string: the Indonesian
+            // and English halves of one row spell the same firm "… dan Rekan"
+            // and "… & Rekan", so RDTX listed `Wahyu, Yasir, Purnamasari`
+            // twice. Keep the first surface form seen.
+            let key = |s: &str| s.to_lowercase().replace("dan rekan", "& rekan");
+            if !appraisers.iter().any(|a| key(a) == key(&name)) {
+                appraisers.push(name);
             }
         }
         if !appraisers.is_empty() {
@@ -2224,6 +2270,52 @@ Jumlah\n\
         assert_eq!(super::pdf_extract::page_of(9999, &starts), Some(3));
         // empty index: an offset belongs to no page, and must not panic
         assert_eq!(super::pdf_extract::page_of(500, &[]), None);
+    }
+
+    #[test]
+    fn test_appraiser_rejects_cross_column_and_repeated_word() {
+        // A bilingual two-column row exactly as `page_rows_to_text` emits it:
+        // the Indonesian and English halves share one visual row, so the line
+        // carries both, and the next line resumes mid-name.
+        let row = "dilakukan penilaian oleh KJPP Jimmy Prasetyo & Rekan, KJPP \
+been assessed by KJPP Jimmy Prasetyo & Rekan, KJPP Susan\n\
+Susan Widjojo & Rekan, dan KJPP Rengganis, Hamid & Rekan,";
+        let got = super::pdf_extract::extract_appraiser_name(row).expect("must find appraisers");
+
+        // The English half must never be captured as part of a firm name.
+        assert!(
+            !got.contains("been assessed"),
+            "English prose leaked: {got}"
+        );
+        assert!(
+            !got.to_uppercase().contains("KJPP BEEN"),
+            "prose leaked: {got}"
+        );
+        // The column merge duplicates the wrapped word; it must be collapsed.
+        assert!(!got.contains("Susan Susan"), "repeated word kept: {got}");
+        // All three firms survive.
+        assert_eq!(got.matches("KJPP").count(), 3, "want 3 firms, got: {got}");
+
+        // The other merge direction: the row ends mid-name in the Indonesian
+        // half, so the match is prefixed by the other language's fragment
+        // ("KJPP independen KJPP Willson & Rekan"). The last `KJPP` is the name.
+        let prefixed = "nilai wajar dilakukan oleh penilai independen KJPP \
+independen KJPP Willson & Rekan, KJPP Rengganis, Hamid & Rekan";
+        let two = super::pdf_extract::extract_appraiser_name(prefixed).unwrap();
+        assert!(two.contains("KJPP Willson & Rekan"), "lost Willson: {two}");
+        assert!(!two.contains("independen KJPP"), "prose kept: {two}");
+
+        // `& Rekan` and `dan Rekan` are the same firm in the two languages of
+        // one row; they must dedupe to a single entry.
+        let both = "dinilai oleh KJPP Wahyu, Yasir, Purnamasari & Rekan dan \
+KJPP Wahyu, Yasir, Purnamasari dan Rekan";
+        let dedup = super::pdf_extract::extract_appraiser_name(both).unwrap();
+        assert_eq!(dedup.matches("KJPP").count(), 1, "not deduped: {dedup}");
+
+        // A clean single-line statement still parses unchanged.
+        let plain = "dilakukan penilaian oleh KJPP Ayon Suherman & Rekan.";
+        let one = super::pdf_extract::extract_appraiser_name(plain).unwrap();
+        assert_eq!(one, "KJPP Ayon Suherman & Rekan");
     }
 
     #[test]
