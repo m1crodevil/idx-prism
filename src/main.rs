@@ -200,8 +200,12 @@ fn run_extract(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "vlm")]
         if args.vlm {
             let (page, deterministic) = vlm_seed;
-            report.pdf_appraiser_vlm =
-                Some(vlm::validate(pdf_path, page, deterministic.as_deref())?);
+            report.pdf_appraiser_vlm = Some(vlm::validate(
+                pdf_path,
+                page,
+                deterministic.as_deref(),
+                report.current_year_instant,
+            )?);
         }
     }
 
@@ -1934,72 +1938,274 @@ fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
 // -------------------------------------------------------------------------
 // Second extraction channel: VLM validation of the appraiser field
 // -------------------------------------------------------------------------
+// Second extraction channel: VLM reading of the investment-property note
+// -------------------------------------------------------------------------
 // Built with `--features vlm`. The deterministic path stays the primary source;
 // this channel exists to satisfy one research requirement — a reported value must
 // be checkable against something that did not produce it. The model reads a
-// RENDERED page and returns strict JSON, and every quote it returns is then
-// verified against that page's own text layer, so a name the model invented
+// RENDERED page and returns strict JSON, and every claim it returns is then
+// checked against that page's own text layer, so a value the model invented
 // cannot pass as evidence.
 
 #[cfg(feature = "vlm")]
 mod vlm {
     use base64::Engine;
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize};
     use std::error::Error;
     use std::path::Path;
 
-    /// One firm as the model reported it.
+    // ---------------------------------------------------------------------
+    // Structured output
+    // ---------------------------------------------------------------------
+    // The note is asked for in one object rather than field by field. The
+    // invariants that make this robust against a model, not just against a
+    // schema-conformant server:
+    //   - every struct is `#[serde(default)]`, so a partial answer still
+    //     deserializes instead of failing the whole filing on one missing key
+    //   - every scalar is `Option`, so "not disclosed" and "model omitted it"
+    //     both land as None rather than as a fabricated zero
+    //   - numbers arrive through `de_num`, which accepts a JSON number, a digit
+    //     string, or Indonesian grouping ("Rp12.571.596")
+    //   - no `deny_unknown_fields`: a model that adds a helpful extra key should
+    //     not break the run over it
+
+    /// MFDI item 1 — PSAK 240 ¶75(a).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MeasurementModel {
+        Cost,
+        FairValue,
+        Revaluation,
+        /// The note states no model, or states one we do not recognise. Distinct
+        /// from a model we failed to parse.
+        #[serde(other)]
+        Unknown,
+    }
+
+    /// A number as a model may render it. `Rp` prefixes, non-breaking spaces and
+    /// Indonesian thousands separators all normalise to a plain f64.
+    pub(crate) fn parse_number(raw: &str) -> Option<f64> {
+        let t = raw.trim();
+        // A leading currency token: "Rp", "Rp.", "IDR", "Rp12.571.596".
+        let t = t
+            .trim_start_matches(|c: char| c.is_alphabetic())
+            .trim_start_matches('.')
+            .trim_end_matches(|c: char| c.is_alphabetic())
+            .replace(['\u{a0}', ' '], "");
+        if t.is_empty() {
+            return None;
+        }
+        let (dot, comma) = (t.contains('.'), t.contains(','));
+        let normalized = match (dot, comma) {
+            // Both present: whichever comes LAST is the decimal separator.
+            (true, true) => {
+                if t.rfind('.') > t.rfind(',') {
+                    t.replace(',', "")
+                } else {
+                    t.replace('.', "").replace(',', ".")
+                }
+            }
+            // One kind only: grouped thousands, or a decimal. Grouping is
+            // judged by shape (first group 1-3 digits, then groups of 3), so
+            // "1.807.237" is a number and "12.5" is a decimal.
+            (true, false) if is_grouped(&t, '.') => t.replace('.', ""),
+            (false, true) if is_grouped(&t, ',') => t.replace(',', ""),
+            (false, true) => t.replace(',', "."),
+            _ => t,
+        };
+        normalized.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    fn is_grouped(s: &str, sep: char) -> bool {
+        let parts: Vec<&str> = s.split(sep).collect();
+        parts.len() > 1 && parts[0].len() <= 3 && parts[1..].iter().all(|p| p.len() == 3)
+    }
+
+    fn de_num<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        let v = Option::<serde_json::Value>::deserialize(d)?;
+        Ok(v.and_then(|v| match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => parse_number(&s),
+            _ => None,
+        }))
+    }
+
+    /// MFDI item 3 — PSAK 240 ¶79(c): gross cost, accumulated depreciation, and
+    /// the net carrying amount.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct CarryingAmounts {
+        #[serde(deserialize_with = "de_num")]
+        pub gross_cost: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub accumulated_depreciation: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub net_book_value: Option<f64>,
+        /// The year the figures belong to, if the note labels it.
+        pub period: Option<String>,
+    }
+
+    /// MFDI item 4 — PSAK 240 ¶79(d): one line of the movement table.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct Movement {
+        pub label: String,
+        #[serde(deserialize_with = "de_num")]
+        pub opening: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub additions: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub deductions: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub reclassifications: Option<f64>,
+        #[serde(deserialize_with = "de_num")]
+        pub closing: Option<f64>,
+    }
+
+    /// MFDI item 6 — one independent appraiser.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Firm {
         pub name: String,
         #[serde(default)]
         pub quote: String,
-        /// Set by us, never by the model: true only when `quote` occurs in the
+        /// Set by us, never by the model: true only when `name` occurs in the
         /// deterministic text of the rendered page. A model cannot mark its own
         /// homework.
         #[serde(default)]
         pub verified: bool,
     }
 
-    #[derive(Debug, Deserialize)]
-    struct Answer {
-        #[serde(default)]
-        appraisers: Vec<Firm>,
-        #[serde(default)]
-        scope: String,
+    /// One investment-property note, as read from the rendered pages.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct Note {
+        /// MFDI 1. Accepts the model's wording via aliases rather than demanding
+        /// our exact token.
+        #[serde(alias = "model", alias = "pengukuran")]
+        pub measurement_model: Option<MeasurementModel>,
+        /// MFDI 2.
+        pub depreciation_policy: Option<String>,
+        pub useful_life: Option<String>,
+        /// MFDI 3.
+        pub carrying_amounts: Option<CarryingAmounts>,
+        /// MFDI 4.
+        pub reconciliation: Vec<Movement>,
+        /// MFDI 5. Item 5 is scored on disclosure, so the amount is captured as
+        /// a number for the panel AND as its source sentence for the record.
+        #[serde(deserialize_with = "de_num")]
+        pub fair_value_amount: Option<f64>,
+        pub fair_value_quote: Option<String>,
+        /// MFDI 6.
+        pub appraisers: Vec<Firm>,
+        /// MFDI 7.
+        pub appraisal_date: Option<String>,
+        /// MFDI 8.
+        pub valuation_methods: Vec<String>,
+        pub significant_assumptions: Vec<String>,
+        /// MFDI 9.
+        pub location_composition: Option<String>,
+        /// Which note the model believes it read. Lets a caller reject a page
+        /// that turned out to hold a different note.
+        pub note_kind: Option<String>,
+        /// The note's stated scale: \"jutaan\" (millions), \"ribuan\" (thousands), or
+        /// \"rupiah\". Required to compare the note's figures with XBRL, which is
+        /// always in full rupiah — measured, the scale DIFFERS per issuer
+        /// (CTRA 2024 prints millions, APLN 2024 prints thousands), so a
+        /// naive equality check reports a false mismatch on one of them.
+        pub currency_unit: Option<String>,
     }
 
+    /// The prompt's example object, kept as the single source of truth: the
+    /// prompt interpolates it, and a test deserializes it, so the schema and the
+    /// instructions cannot drift apart.
+    pub(crate) const SCHEMA_EXAMPLE: &str = r#"{
+  "note_kind": "investment_property",
+  "measurement_model": "cost",
+  "depreciation_policy": "garis lurus",
+  "useful_life": "20 - 50 tahun",
+  "carrying_amounts": {"period": "2024", "gross_cost": "6.803.293", "accumulated_depreciation": "1.807.237", "net_book_value": "4.996.056"},
+  "reconciliation": [
+    {"label": "Tanah", "opening": "719.084", "additions": "1.152", "deductions": null, "reclassifications": "19.755", "closing": "739.991"}
+  ],
+  "fair_value_amount": "Rp12.571.596",
+  "fair_value_quote": "Nilai wajar properti investasi tertentu adalah sebesar Rp12.571.596",
+  "appraisers": [{"name": "KJPP Willson & Rekan", "quote": "penilai independen KJPP Willson & Rekan"}],
+  "appraisal_date": "11 Maret 2025",
+  "valuation_methods": ["metode biaya dan pendapatan"],
+  "significant_assumptions": ["penggunaan tertinggi dan terbaik adalah penggunaan saat ini"],
+  "location_composition": "tanah, bangunan dan prasarana",
+  "currency_unit": "jutaan"
+}"#;
+
+    pub(crate) fn prompt() -> String {
+        format!(
+            "\
+You are reading the investment-property note (Indonesian: \"Properti investasi\") of a \
+financial statement. Report ONLY what the note states about investment property.
+
+Return STRICT JSON only, no prose, in exactly this shape:
+{SCHEMA_EXAMPLE}
+
+Rules:
+- Use null for anything the note does not state, and [] for an empty list. Never \
+invent a value and never carry one in from another note: a null is a valid, useful answer.
+- Copy numbers as they are printed, including Indonesian grouping (\"6.803.293\"). Do not \
+reformat, round, or convert units.
+- `depreciation_policy` is the method (e.g. \"garis lurus\" / straight-line). \
+`useful_life` is the range (e.g. \"20 - 50 tahun\"). Keep them separate.
+- `carrying_amounts` covers gross cost, accumulated depreciation and net book value — the \
+note's own three figures, for its most recent column.
+- `reconciliation` is the movement table, one entry per labelled row, in the order printed.
+- `appraisers` are the independent appraisers (\"KJPP\") named for INVESTMENT PROPERTY. If a \
+firm appears only for an acquisition, business combination or fixed assets, leave it out and \
+say so in `note_kind`. `quote` must be copied verbatim from the page.
+- `valuation_methods` and `significant_assumptions` are what the note says the valuation used.
+- `note_kind` is \"investment_property\" only if this really is that note; otherwise name what \
+the pages actually show (e.g. \"business_combination\", \"fixed_assets\", \"none\").
+- `currency_unit` is the scale the note states in its header, e.g. the \"jutaan rupiah\" / \
+\"ribuan rupiah\" / \"millions\" / \"thousands\" phrase. Copy the wording used; this is what lets \
+a reader reconcile the figures against the tagged data, and it differs between issuers.
+- The pages are bilingual: the Indonesian and English halves of a sentence sit on the same \
+visual row. Read one language; do not mix them within a quoted field.
+- If the pages do not contain the investment-property note at all, return the same object \
+with nulls, empty lists, and \"note_kind\": \"none\"."
+        )
+    }
+
+    /// What we report back: the note, plus which of its claims we could confirm.
     #[derive(Debug, Serialize)]
     pub struct Evidence {
         pub model: String,
         /// 1-based pages actually sent, after clamping to the document.
         pub pages: Vec<usize>,
-        pub scope: String,
-        pub appraisers: Vec<Firm>,
-        /// How many reported firms had their quote found on the page.
-        pub verified: usize,
-        /// Did the model's reading agree with the deterministic extraction?
+        pub note: Note,
+        /// Field names whose value was found in the page's own text layer.
+        pub verified_fields: Vec<String>,
+        /// Claims the model made that the page text does NOT support. Non-empty
+        /// means the reading is not trustworthy for those fields.
+        pub unverified: Vec<String>,
+        /// Movement rows whose own arithmetic does not close
+        /// (opening + additions - deductions + reclassifications != closing).
+        ///
+        /// The text-layer check proves a value was ON the page; it cannot prove
+        /// that no value was LEFT OUT, because an omission leaves nothing to
+        /// look for. Arithmetic can: a row that does not add up was read
+        /// incompletely. This caught CTRA 2024, where the model returned
+        /// `reclassifications: null` for a row the note prints as (78.710).
+        pub reconciliation_inconsistent: Vec<String>,
+        /// Did the model's appraiser reading agree with the deterministic one?
         pub agrees_with_deterministic: bool,
+        /// Does the note's net book value, scaled by the note's OWN stated unit,
+        /// equal the XBRL carrying amount? `None` means it could not be checked
+        /// (no figure, no unit, or no XBRL value) — kept distinct from `false`,
+        /// which means checked and mismatched.
+        ///
+        /// This is the strongest check available: the two sides come from
+        /// different files by different producers (an XBRL tag vs a rendered
+        /// page read by a model), so agreement is not circular.
+        pub carrying_matches_xbrl: Option<bool>,
         pub raw_response: String,
     }
-
-    const PROMPT: &str = "\
-You are reading one or more pages of an Indonesian financial statement. Report the \
-independent appraiser (Kantor Jasa Penilai Publik, written \"KJPP\") used for the \
-INVESTMENT PROPERTY (\"properti investasi\") measurement specifically.
-
-Return STRICT JSON only, no prose, in exactly this shape:
-{\"appraisers\":[{\"name\":\"KJPP <name> & Rekan\",\"quote\":\"<verbatim text copied from the page>\"}],\"scope\":\"investment_property\"}
-
-Rules:
-- `quote` MUST be copied verbatim from the page image, character for character. It is \
-checked against the page text, and a quote that cannot be found is discarded.
-- The pages are bilingual: the Indonesian and English halves of a sentence sit on the \
-same visual row. Quote only ONE language.
-- If an appraiser appears but belongs to an acquisition, business combination, or fixed \
-assets rather than investment property, report it with scope \"other\" instead.
-- If no appraiser appears at all, return {\"appraisers\":[],\"scope\":\"none\"}.
-- Never invent a firm name or a quote. An empty result is a valid answer.";
 
     fn env_nonempty(key: &str) -> Option<String> {
         std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -2026,20 +2232,56 @@ assets rather than investment property, report it with scope \"other\" instead.
         t.trim_end_matches("```").trim()
     }
 
-    /// The per-page text the deterministic path sees, for quote verification.
-    /// Shares `extract_pdf_text`'s row rebuild so both channels read the same
-    /// words in the same order — a verification that used a different reading
-    /// would prove nothing about the deterministic result.
+    /// The per-page text the deterministic path sees. Shares
+    /// `page_rows_to_text` so both channels read the same words in the same
+    /// order — a verification that used a different reading would prove nothing
+    /// about the deterministic result.
     fn page_text(doc: &pdf_oxide::PdfDocument, page: usize) -> String {
         doc.extract_words(page)
             .map(|w| super::pdf_extract::page_rows_to_text(&w))
             .unwrap_or_default()
     }
 
+    /// Multiplier from the note's stated scale to full rupiah. XBRL reports full
+    /// rupiah; the note states its own scale, and that scale changes per issuer.
+    pub(crate) fn unit_multiplier(unit: &str) -> Option<f64> {
+        let u = unit.to_lowercase();
+        if u.contains("juta") || u.contains("million") {
+            Some(1_000_000.0)
+        } else if u.contains("ribu") || u.contains("thousand") {
+            Some(1_000.0)
+        } else if u.contains("rupiah") || u.contains("rupiah penuh") || u == "idr" {
+            Some(1.0)
+        } else {
+            None
+        }
+    }
+
+    /// A figure as it appears in the page text, in Indonesian grouping —
+    /// 12571596 renders as "12.571.596".
+    pub(crate) fn id_grouped(v: f64) -> String {
+        let n = v.round() as i64;
+        let neg = n < 0;
+        let digits = n.abs().to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                out.push('.');
+            }
+            out.push(c);
+        }
+        if neg {
+            format!("-{}", out)
+        } else {
+            out
+        }
+    }
+
     pub fn validate(
         pdf: &Path,
         region_page: Option<usize>,
         deterministic: Option<&str>,
+        xbrl_carrying: Option<i64>,
     ) -> Result<Evidence, Box<dyn Error>> {
         let base_url = env_nonempty("IDXPRISM_VLM_BASE_URL")
             .ok_or("IDXPRISM_VLM_BASE_URL is not set (e.g. https://your-host/v1)")?;
@@ -2054,9 +2296,9 @@ assets rather than investment property, report it with scope \"other\" instead.
 
         // The page provenance is a heuristic, not exact: measured against
         // per-page ground truth it hit the page for some filings and was off by
-        // one for others (the anchor and the appraiser sentence are not always
-        // on the same page). So send a window and let the model see the
-        // neighbourhood rather than betting the result on one index.
+        // one for others (the note anchor and the appraisers do not always share
+        // a page). So send a window and let the model see the neighbourhood
+        // rather than betting the result on one index.
         let base = region_page.unwrap_or(1).max(1);
         let first = base.saturating_sub(1).max(1);
         let last = (base + 1).min(count);
@@ -2071,7 +2313,8 @@ assets rather than investment property, report it with scope \"other\" instead.
             texts.push(page_text(&doc, p - 1));
         }
 
-        let mut content = vec![serde_json::json!({"type": "text", "text": PROMPT})];
+        let text = prompt();
+        let mut content = vec![serde_json::json!({"type": "text", "text": text})];
         for b64 in &images {
             content.push(serde_json::json!({
                 "type": "image_url",
@@ -2099,61 +2342,134 @@ assets rather than investment property, report it with scope \"other\" instead.
             .ok_or("VLM response had no choices[0].message.content")?
             .to_string();
 
-        let answer: Answer = serde_json::from_str(unfence(&raw_response)).map_err(|e| {
+        let mut note: Note = serde_json::from_str(unfence(&raw_response)).map_err(|e| {
             format!(
                 "VLM content was not the requested JSON: {} in {:?}",
                 e,
-                unfence(&raw_response).chars().take(160).collect::<String>()
+                unfence(&raw_response).chars().take(200).collect::<String>()
             )
         })?;
 
-        // Verification channel: the reported NAME must occur in the page's own
-        // text layer, so a fabricated firm is reported as unverified instead of
-        // silently passing.
-        //
-        // The NAME is verified, not the whole `quote`. These filings are
-        // bilingual and the row rebuild interleaves the Indonesian and English
-        // halves of a sentence by x-position, so a quote copied from ONE column
-        // is by construction not a contiguous span of our page text — requiring
-        // a verbatim quote match failed on all three APLN firms while the model
-        // had read the page correctly. The name is the actual claim, and an
-        // invented one still fails because it occurs nowhere on the page.
-        // `quote` is kept as provenance for a human to read; it is not the gate.
-        // The verification haystack must be normalized the same way the
+        // Verification channel. The haystack is normalized the same way the
         // deterministic extractor normalizes before it matches, or the two are
-        // compared on unequal footing. A name wrapping across rows arrives with
+        // compared on unequal footing: a name wrapping across rows arrives with
         // its first word duplicated ("KJPP Susan" + "Susan Widjojo"), and that
-        // duplicate straddles a line break — so the collapse has to run over the
-        // JOINED text, not per line, or "KJPP Susan Widjojo & Rekan" is never
-        // found and a correctly-read name is reported unverified.
+        // duplicate straddles a line break, so the collapse has to run over the
+        // JOINED text rather than per line.
         let hay = norm_name(&super::pdf_extract::collapse_repeated_word(
             &texts.join(" "),
         ));
-        let mut appraisers = answer.appraisers;
-        for f in appraisers.iter_mut() {
+
+        let mut verified_fields = Vec::new();
+        let mut unverified = Vec::new();
+
+        // Names: the actual claim. An invented firm occurs nowhere on the page.
+        for f in note.appraisers.iter_mut() {
             let key = norm_name(&f.name);
             f.verified = !key.is_empty() && hay.contains(&key);
+            if f.verified {
+                verified_fields.push(format!("appraisers[{}]", f.name));
+            } else {
+                unverified.push(format!("appraisers[{}]", f.name));
+            }
         }
-        let verified = appraisers.iter().filter(|f| f.verified).count();
+
+        // Figures: checked in the page's own formatting. A number the note does
+        // not print is a number the model did not read off the page.
+        let mut check_num = |label: &str, v: Option<f64>| {
+            if let Some(v) = v {
+                if hay.contains(&id_grouped(v)) {
+                    verified_fields.push(label.to_string());
+                } else {
+                    unverified.push(format!("{}={}", label, id_grouped(v)));
+                }
+            }
+        };
+        check_num("fair_value_amount", note.fair_value_amount);
+        if let Some(ca) = &note.carrying_amounts {
+            check_num("carrying_amounts.gross_cost", ca.gross_cost);
+            check_num(
+                "carrying_amounts.accumulated_depreciation",
+                ca.accumulated_depreciation,
+            );
+            check_num("carrying_amounts.net_book_value", ca.net_book_value);
+        }
+        for m in note.reconciliation.iter() {
+            for (k, v) in [
+                ("opening", m.opening),
+                ("additions", m.additions),
+                ("deductions", m.deductions),
+                ("reclassifications", m.reclassifications),
+                ("closing", m.closing),
+            ] {
+                if let Some(v) = v {
+                    let label = format!("reconciliation[{}].{}", m.label, k);
+                    if hay.contains(&id_grouped(v)) {
+                        verified_fields.push(label);
+                    } else {
+                        unverified.push(format!("{}={}", label, id_grouped(v)));
+                    }
+                }
+            }
+        }
+
+        // Omission check. Only rows that actually carry movements are testable:
+        // a memo line ("Nilai buku neto") prints an opening and a closing but no
+        // movement columns, so its pair is not expected to add up.
+        let mut reconciliation_inconsistent = Vec::new();
+        for m in note.reconciliation.iter() {
+            let (Some(opening), Some(closing)) = (m.opening, m.closing) else {
+                continue;
+            };
+            let has_movement =
+                m.additions.is_some() || m.deductions.is_some() || m.reclassifications.is_some();
+            if !has_movement {
+                continue;
+            }
+            let expected = opening + m.additions.unwrap_or(0.0) - m.deductions.unwrap_or(0.0)
+                + m.reclassifications.unwrap_or(0.0);
+            if (expected - closing).abs() > 1.0 {
+                reconciliation_inconsistent.push(format!(
+                    "{}: expected {:.0}, printed {:.0}",
+                    m.label, expected, closing
+                ));
+            }
+        }
 
         let agrees = match deterministic {
-            Some(d) if !d.trim().is_empty() => appraisers.iter().any(|f| {
-                f.verified
-                    && d.to_lowercase()
-                        .contains(&f.name.trim().to_lowercase().replace("dan rekan", "& rekan"))
-            }),
+            Some(d) if !d.trim().is_empty() => note
+                .appraisers
+                .iter()
+                .any(|f| f.verified && d.to_lowercase().contains(&norm_name(&f.name))),
             // Nothing to compare against: agreement is only meaningful when the
             // deterministic channel produced something.
             _ => false,
         };
 
+        // Independent-channel check: the note's net book value against the XBRL
+        // tag, using the scale the note itself states. Measured, that scale is
+        // NOT uniform across issuers — CTRA 2024 prints millions, APLN 2024
+        // prints thousands — so an assumed multiplier reports a false mismatch.
+        let carrying_matches_xbrl = (|| {
+            let v = note.carrying_amounts.as_ref()?.net_book_value?;
+            let multiplier = unit_multiplier(note.currency_unit.as_deref()?)?;
+            let xbrl = xbrl_carrying? as f64;
+            if xbrl <= 0.0 {
+                return None;
+            }
+            // Tolerance covers the note's rounding to its stated scale.
+            Some((v * multiplier - xbrl).abs() / xbrl < 1e-4)
+        })();
+
         Ok(Evidence {
             model,
             pages,
-            scope: answer.scope,
-            appraisers,
-            verified,
+            note,
+            verified_fields,
+            unverified,
+            reconciliation_inconsistent,
             agrees_with_deterministic: agrees,
+            carrying_matches_xbrl,
             raw_response,
         })
     }
@@ -2600,6 +2916,193 @@ Jumlah\n\
 18.535.695.255\n\
 100%\n";
         assert_eq!(super::pdf_extract::extract_ownership(txt), None);
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_prompt_example_matches_schema() {
+        // Drift guard: the prompt shows this exact object, and this test
+        // deserializes it. Change the struct without the prompt (or the reverse)
+        // and the build fails, instead of the model being asked for a shape we
+        // can no longer read.
+        let note: super::vlm::Note =
+            serde_json::from_str(super::vlm::SCHEMA_EXAMPLE).expect("prompt example must parse");
+        assert_eq!(note.note_kind.as_deref(), Some("investment_property"));
+        assert_eq!(
+            note.measurement_model,
+            Some(super::vlm::MeasurementModel::Cost)
+        );
+        // Every numeric field arrives as a quoted string in the example, and
+        // must still land as a number.
+        let ca = note.carrying_amounts.expect("carrying amounts");
+        assert_eq!(ca.gross_cost, Some(6_803_293.0));
+        assert_eq!(ca.accumulated_depreciation, Some(1_807_237.0));
+        assert_eq!(ca.net_book_value, Some(4_996_056.0));
+        assert_eq!(note.fair_value_amount, Some(12_571_596.0));
+        assert_eq!(note.reconciliation.len(), 1);
+        assert_eq!(note.reconciliation[0].closing, Some(739_991.0));
+        // null in the movement row is "not printed", not zero.
+        assert_eq!(note.reconciliation[0].deductions, None);
+        assert_eq!(note.appraisers.len(), 1);
+        assert!(note.depreciation_policy.is_some());
+        assert_eq!(note.useful_life.as_deref(), Some("20 - 50 tahun"));
+        assert_eq!(note.currency_unit.as_deref(), Some("jutaan"));
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_tolerates_partial_and_unknown_output() {
+        // A model that omits everything but one field must not fail the parse.
+        let min: super::vlm::Note = serde_json::from_str("{}").expect("empty object must parse");
+        assert!(min.appraisers.is_empty());
+        assert_eq!(min.fair_value_amount, None);
+        assert_eq!(min.note_kind, None);
+        // An unrecognised model name must land as Unknown, not an error: that is
+        // the difference between "the note says something else" and "we could not
+        // read the answer".
+        let odd: super::vlm::Note =
+            serde_json::from_str(r#"{"measurement_model":"hybrid-ish"}"#).unwrap();
+        assert_eq!(
+            odd.measurement_model,
+            Some(super::vlm::MeasurementModel::Unknown)
+        );
+        // Extra keys a helpful model might add must not break the run.
+        let extra: super::vlm::Note =
+            serde_json::from_str(r#"{"note_kind":"investment_property","confidence":"high"}"#)
+                .expect("unknown field must be ignored");
+        assert_eq!(extra.note_kind.as_deref(), Some("investment_property"));
+        // An alias must reach the same field.
+        let aliased: super::vlm::Note = serde_json::from_str(r#"{"model":"fair_value"}"#).unwrap();
+        assert_eq!(
+            aliased.measurement_model,
+            Some(super::vlm::MeasurementModel::FairValue)
+        );
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_parse_number_indonesian_and_english() {
+        use super::vlm::parse_number;
+        // Indonesian: dot groups, comma decimal.
+        assert_eq!(parse_number("6.803.293"), Some(6_803_293.0));
+        assert_eq!(parse_number("Rp12.571.596"), Some(12_571_596.0));
+        assert_eq!(parse_number("46,60"), Some(46.60));
+        assert_eq!(parse_number("Rp 1.807.237"), Some(1_807_237.0));
+        // English: comma groups, dot decimal.
+        assert_eq!(parse_number("12,571,596"), Some(12_571_596.0));
+        assert_eq!(parse_number("46.60"), Some(46.60));
+        // Both present: the LAST separator is the decimal point.
+        assert_eq!(parse_number("1.234.567,89"), Some(1_234_567.89));
+        assert_eq!(parse_number("1,234,567.89"), Some(1_234_567.89));
+        // A short decimal must not be mistaken for a grouping.
+        assert_eq!(parse_number("12.5"), Some(12.5));
+        // Negative and zero survive; junk is None rather than a silent 0.
+        assert_eq!(parse_number("-655"), Some(-655.0));
+        assert_eq!(parse_number("0"), Some(0.0));
+        assert_eq!(parse_number("n/a"), None);
+        assert_eq!(parse_number(""), None);
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_id_grouped_roundtrips_with_parse_number() {
+        use super::vlm::{id_grouped, parse_number};
+        // The verification channel renders a number back into the page's own
+        // format to look for it, so the two must be exact inverses.
+        for v in [
+            0.0,
+            41.0,
+            999.0,
+            1000.0,
+            12_571_596.0,
+            6_803_293.0,
+            1_807_237.0,
+        ] {
+            let printed = id_grouped(v);
+            assert_eq!(
+                parse_number(&printed),
+                Some(v),
+                "roundtrip for {v} via {printed}"
+            );
+        }
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_reconciliation_arithmetic_detects_omission() {
+        use super::vlm::Movement;
+        // Mirrors CTRA 2024 as the model actually returned it: the note prints
+        // reclassifications (78.710) for this row, the model dropped it, so the
+        // row does not close. Arithmetic is the only check that sees this —
+        // every value the model DID return was present on the page.
+        let dropped = Movement {
+            label: "Bangunan dan prasarana".into(),
+            opening: Some(6_077_718.0),
+            additions: Some(12_258.0),
+            deductions: Some(6.0),
+            reclassifications: None,
+            closing: Some(6_011_260.0),
+        };
+        assert!(
+            (dropped.opening.unwrap() + dropped.additions.unwrap()
+                - dropped.deductions.unwrap()
+                - dropped.closing.unwrap())
+            .abs()
+                > 1.0,
+            "a dropped movement column must not close"
+        );
+        // With the column present the same row closes exactly.
+        let complete = Movement {
+            reclassifications: Some(-78_710.0),
+            ..dropped.clone()
+        };
+        let expected = complete.opening.unwrap() + complete.additions.unwrap()
+            - complete.deductions.unwrap()
+            + complete.reclassifications.unwrap();
+        assert_eq!(expected, complete.closing.unwrap());
+        // A memo row (opening + closing, no movement columns) is not testable
+        // and must not be reported as inconsistent.
+        let memo = Movement {
+            label: "Nilai buku neto".into(),
+            opening: Some(5_189_234.0),
+            closing: Some(4_996_056.0),
+            ..Default::default()
+        };
+        assert!(
+            memo.additions.is_none()
+                && memo.deductions.is_none()
+                && memo.reclassifications.is_none()
+        );
+    }
+
+    #[cfg(feature = "vlm")]
+    #[test]
+    fn test_vlm_unit_multiplier_reconciles_note_to_xbrl() {
+        use super::vlm::unit_multiplier;
+        // Measured per-issuer scales, checked against XBRL's full-rupiah tag:
+        //   CTRA 2024 note 4.996.056  x 1e6 = 4 996 056 000 000  == XBRL
+        //   APLN 2024 note 6 071 535 743 x 1e3 = 6 071 535 743 000 ~= XBRL
+        // The same note figure under the wrong multiplier is off by 1000x, which
+        // is why the unit has to be read rather than assumed.
+        assert_eq!(unit_multiplier("jutaan rupiah"), Some(1_000_000.0));
+        assert_eq!(unit_multiplier("Disajikan dalam jutaan"), Some(1_000_000.0));
+        assert_eq!(unit_multiplier("expressed in millions"), Some(1_000_000.0));
+        assert_eq!(unit_multiplier("ribuan rupiah"), Some(1_000.0));
+        assert_eq!(unit_multiplier("in thousands"), Some(1_000.0));
+        assert_eq!(unit_multiplier("rupiah"), Some(1.0));
+
+        let xbrl_ctra = 4_996_056_000_000i64;
+        assert_eq!(
+            4_996_056.0 * unit_multiplier("jutaan").unwrap(),
+            xbrl_ctra as f64
+        );
+        let xbrl_apln = 6_071_536_000_000i64;
+        let scaled = 6_071_535_743.0 * unit_multiplier("ribuan").unwrap();
+        assert!((scaled - xbrl_apln as f64).abs() / (xbrl_apln as f64) < 1e-6);
+        // An unstated or unrecognised scale yields None, so a caller can tell
+        // "cannot check" apart from "checked and mismatched".
+        assert_eq!(unit_multiplier(""), None);
+        assert_eq!(unit_multiplier("tidak dinyatakan"), None);
     }
 
     #[cfg(feature = "vlm")]

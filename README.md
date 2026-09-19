@@ -240,11 +240,30 @@ export IDXPRISM_VLM_MODEL="ali/kimi-k2.7-code"   # optional, this is the default
 idx-prism CTRA -f instance.zip -y 2024 --pdf lapkeu.pdf --vlm
 ```
 
-Three design choices worth knowing:
+It reads the whole investment-property note in one object, not one field at a time — the nine MFDI items plus the note's stated scale:
 
-* **A window of pages is rendered, not one.** The page provenance (`pdf_ip_region_page`) is a heuristic: measured against per-page ground truth it hit the page exactly for some filings and was off by one for others, because the note anchor and the appraiser sentence do not always share a page. The rendered window is `page-1 .. page+1`, so one wrong index cannot decide the result.
-* **The model's NAME is verified against the page's own text layer, not its quote.** Filings are bilingual and the row rebuild interleaves the Indonesian and English halves of a sentence by x-position, so a quote copied from *one* column is by construction not a contiguous span of our page text — requiring a verbatim quote match failed on every firm while the model had read the page correctly. The name is the actual claim, and an invented one still fails, because it occurs nowhere on the page. Each firm is reported with `verified: true|false`.
-* **`scope` is reported, not assumed.** The model distinguishes an appraiser used for investment property from one quoted for an acquisition, a business combination, or fixed assets. That distinction matters: an issuer can name a different firm for each.
+| MFDI item | Field | PSAK 240 |
+|---|---|---|
+| 1 model pengukuran | `measurement_model` | ¶75(a) |
+| 2 kebijakan penyusutan | `depreciation_policy`, `useful_life` | ¶79(a)-(b) |
+| 3 bruto / akumulasi / neto | `carrying_amounts` | ¶79(c) |
+| 4 rekonsiliasi | `reconciliation[]` | ¶79(d) |
+| 5 nilai wajar | `fair_value_amount` | ¶79(e) |
+| 6 penilai independen | `appraisers[]` | ¶75(e) |
+| 7 tanggal laporan | `appraisal_date` | OJK |
+| 8 metode & asumsi | `valuation_methods[]`, `significant_assumptions[]` | OJK |
+| 9 lokasi & komposisi | `location_composition` | ¶75 |
+| — skala catatan | `currency_unit` | — |
+
+Items 1 and 2 are normally already covered by the XBRL policy text block, which contains the measurement sentence and the depreciation policy; the model's answer is a cross-check for those, and the primary source for 3, 4 and 8, which XBRL does not tag at all.
+
+**Three verification channels, each catching what the others cannot:**
+
+* **Text layer** — every name and figure the model reports is looked for in the page's own text, in the note's own formatting. Catches a *fabricated* value: an invented one occurs nowhere on the page. Reported as `verified_fields` / `unverified`.
+* **Arithmetic** — a movement row must close (`opening + additions - deductions + reclassifications = closing`). Catches an *omitted* value, which the text-layer check cannot see because an omission leaves nothing to look for. Measured on CTRA 2024, the model dropped a reclassification column and four rows failed to close.
+* **Independent channel** — the note's net book value, scaled by the scale the note itself states, must equal the XBRL carrying amount. The two sides come from different files by different producers, so agreement is not circular. The scale is read, not assumed: CTRA 2024 prints millions and APLN 2024 prints thousands, so a fixed multiplier reports a false mismatch on one of them. Reported as `carrying_matches_xbrl` (`null` = could not be checked, distinct from `false` = checked and mismatched).
+
+The rendered window is `page-1 .. page+1`: `pdf_ip_region_page` is a heuristic that measured exact for some filings (APLN 62, CTRA 107) and off by one for others (ASRI 265→266, KIJA 355→356), so one wrong index must not decide the result.
 
 The channel costs one request per filing, so it is intended for the subset that needs corroboration, not the whole corpus. It is behind a Cargo feature because it pulls a rasteriser and a TLS stack that the deterministic pipeline does not need.
 
