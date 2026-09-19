@@ -8,7 +8,9 @@ use std::error::Error;
 use std::fs;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Default, Serialize)]
 struct FinancialReportData {
@@ -116,6 +118,7 @@ fn main() {
         Some("sector") => run_sector(&args[1..]),
         Some("market") => run_market(&args[1..]),
         Some("batch") => run_batch(&args[1..]),
+        Some("fetch") => run_fetch(&args[1..]),
         _ => run_extract(args),
     };
 
@@ -1789,6 +1792,315 @@ fn opt_i64(v: Option<i64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_default()
 }
 
+// -------------------------------------------------------------------------
+// fetch: corpus acquisition with rate discipline
+// -------------------------------------------------------------------------
+
+const USAGE_FETCH: &str = "usage: idx-prism fetch -d <data_dir> --years <from>-<to> [-t <TICKER,TICKER>] [--bin <idxlens|$IDXPRISM_BIN>] [--delay-ms <n>]  (exit: 0 done, 1 failed, 2 re-auth, 3 rate limited)";
+
+struct FetchArgs {
+    data_dir: PathBuf,
+    years: (u32, u32),
+    tickers: Option<Vec<String>>,
+    bin: PathBuf,
+    delay_ms: u64,
+}
+
+fn parse_fetch_args(args: &[String]) -> Result<FetchArgs, Box<dyn Error>> {
+    let (m, _) = parse_flags(
+        args,
+        &[
+            "-d",
+            "--dir",
+            "--years",
+            "-t",
+            "--tickers",
+            "--bin",
+            "--delay-ms",
+        ],
+    );
+    help_if_requested(&m, USAGE_FETCH);
+
+    let data_dir = flag(&m, &["-d", "--dir"])
+        .map(PathBuf::from)
+        .ok_or("Error: -d / --dir <data_dir> is required")?;
+    let years = flag(&m, &["--years"])
+        .and_then(|v| {
+            let (a, b) = v.split_once('-')?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        })
+        .ok_or("Error: --years <from>-<to> is required")?;
+
+    Ok(FetchArgs {
+        data_dir,
+        years,
+        tickers: flag(&m, &["-t", "--tickers"]).map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }),
+        // Flag, then environment, then PATH. The downloader is not on PATH in
+        // the setup this was built against, so the environment escape hatch is
+        // the one that makes the tool usable without a hardcoded home path.
+        bin: flag(&m, &["--bin"])
+            .map(PathBuf::from)
+            .or_else(|| env::var("IDXPRISM_BIN").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("idxlens")),
+        // A request every second is a fraction of what the previous drivers did
+        // and is the whole reason this exists; `--delay-ms 0` disables it.
+        delay_ms: flag(&m, &["--delay-ms"])
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000),
+    })
+}
+
+/// What happened to one filing request. Three of these are not failures:
+/// a filing that was never published and a filing blocked by rate limiting are
+/// different facts, and reporting the second as the first is how a coverage
+/// number becomes a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOutcome {
+    Fetched,
+    NotPublished,
+    NeedsAuth,
+    RateLimited,
+    Failed,
+}
+
+/// The status code the downloader reports, if any.
+///
+/// It prints one generic "unexpected status N" for both an expired session and
+/// a rate limit, and those need opposite remedies: 403 means re-authenticate,
+/// 429 means stop and wait. Telling them apart is the entire point.
+fn unexpected_status(output: &str) -> Option<u16> {
+    const NEEDLE: &str = "unexpected status ";
+    let rest = &output[output.find(NEEDLE)? + NEEDLE.len()..];
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn classify_fetch(output: &str, exit_ok: bool, files_on_disk: usize) -> FetchOutcome {
+    if let Some(code) = unexpected_status(output) {
+        return match code {
+            403 => FetchOutcome::NeedsAuth,
+            429 => FetchOutcome::RateLimited,
+            _ => FetchOutcome::Failed,
+        };
+    }
+    // The artifact is ground truth; a tool's own success message is not.
+    if files_on_disk > 0 {
+        return FetchOutcome::Fetched;
+    }
+    if exit_ok {
+        FetchOutcome::NotPublished
+    } else {
+        FetchOutcome::Failed
+    }
+}
+
+/// Any regular file under `dir`, recursively. A filing that produced anything
+/// at all counts as present.
+fn count_files_under(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                count_files_under(&p)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// Ticker directories already in the corpus, i.e. the universe worth filling in.
+/// Derived rather than maintained: a separate list is one more thing to drift.
+fn corpus_tickers(data_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| !n.starts_with('.') && !n.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Acquire the filings the corpus is missing, with rate discipline.
+///
+/// Three rules, each from a measured failure:
+///
+///  1. **One request per filing.** Asking availability first and downloading
+///     second doubles the request count against a limit that is the binding
+///     constraint. Absence is decided by the artifact and the tool's own signal.
+///  2. **One worker.** The downloader defaults to four concurrent downloads; the
+///     limit is counted per IP, so concurrency only spends it faster.
+///  3. **403 and 429 stop the run.** Cloudflare blocks for a fixed window
+///     regardless of request rate and its own guidance is that retrying inside
+///     that window extends the block, so continuing gains nothing; resuming
+///     later costs nothing, because a filing already on disk is skipped.
+///
+/// Exit codes: 0 done, 1 some filings failed, 2 session expired (re-auth),
+/// 3 rate limited (wait).
+fn run_fetch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
+    let FetchArgs {
+        data_dir,
+        years,
+        tickers,
+        bin,
+        delay_ms,
+    } = parse_fetch_args(raw_args)?;
+
+    let tickers = tickers.unwrap_or_else(|| corpus_tickers(&data_dir));
+    if tickers.is_empty() {
+        return Err(format!("no ticker directories under {}", data_dir.display()).into());
+    }
+
+    // Only filings the corpus does not have. Nothing is requested blindly.
+    let mut targets: Vec<(String, u32)> = Vec::new();
+    for t in &tickers {
+        for y in years.0..=years.1 {
+            if count_files_under(&data_dir.join(t).join(y.to_string())) == 0 {
+                targets.push((t.clone(), y));
+            }
+        }
+    }
+    if targets.is_empty() {
+        eprintln!(
+            "[fetch] nothing to do: {} tickers all have {}-{}",
+            tickers.len(),
+            years.0,
+            years.1
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "[fetch] {} targets ({} tickers, {}-{}), {} ms apart",
+        targets.len(),
+        tickers.len(),
+        years.0,
+        years.1,
+        delay_ms
+    );
+
+    let mut fetched = 0usize;
+    let mut not_published = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    let mut remaining: Vec<String> = Vec::new();
+    let mut blocked: Option<FetchOutcome> = None;
+
+    for (i, (ticker, year)) in targets.iter().enumerate() {
+        if i > 0 && delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let dir = data_dir.join(ticker).join(year.to_string());
+        let ys = year.to_string();
+        let argv = [
+            "fetch",
+            ticker.as_str(),
+            "-y",
+            ys.as_str(),
+            "-p",
+            "FY",
+            "--workers",
+            "1",
+        ];
+        let out = Command::new(&bin).args(argv).output().map_err(|e| {
+            format!(
+                "cannot run {}: {} — pass --bin <path> or set IDXPRISM_BIN",
+                bin.display(),
+                e
+            )
+        })?;
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        match classify_fetch(&text, out.status.success(), count_files_under(&dir)) {
+            FetchOutcome::Fetched => {
+                fetched += 1;
+                eprintln!("  OK    {ticker} {year}");
+            }
+            FetchOutcome::NotPublished => {
+                not_published += 1;
+                eprintln!("  none  {ticker} {year}");
+            }
+            FetchOutcome::Failed => {
+                failed.push(format!("{ticker} {year}"));
+                eprintln!("  FAIL  {ticker} {year}");
+            }
+            stop => {
+                blocked = Some(stop);
+                remaining = targets[i..]
+                    .iter()
+                    .map(|(t, y)| format!("{t} {y}"))
+                    .collect();
+                break;
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "[fetch] fetched {fetched}, not published {not_published}, failed {}, not attempted {}",
+        failed.len(),
+        remaining.len()
+    );
+    for f in &failed {
+        eprintln!("[fetch] GAGAL: {f}");
+    }
+
+    match blocked {
+        Some(FetchOutcome::NeedsAuth) => {
+            eprintln!();
+            eprintln!("[fetch] STOPPED: 403 — the IDX session has expired.");
+            eprintln!(
+                "[fetch] Fix: `{} auth`, then re-run this command.",
+                bin.display()
+            );
+            for r in &remaining {
+                eprintln!("[fetch]   pending: {r}");
+            }
+            process::exit(2);
+        }
+        Some(FetchOutcome::RateLimited) => {
+            eprintln!();
+            eprintln!("[fetch] STOPPED: 429 — rate limited by IDX.");
+            eprintln!("[fetch] Wait out the block window (hours, not seconds). Do not retry in a");
+            eprintln!(
+                "[fetch] loop: the block lasts a fixed period regardless of request rate and"
+            );
+            eprintln!(
+                "[fetch] retrying inside it extends it. Re-authenticating does not clear it —"
+            );
+            eprintln!("[fetch] the limit is counted per IP, so a fresh cookie resets nothing.");
+            for r in &remaining {
+                eprintln!("[fetch]   pending: {r}");
+            }
+            process::exit(3);
+        }
+        _ => {}
+    }
+
+    if !failed.is_empty() {
+        return Err(format!("{} of {} filings failed", failed.len(), targets.len()).into());
+    }
+    Ok(())
+}
+
 fn run_batch(raw_args: &[String]) -> Result<(), Box<dyn Error>> {
     let args = parse_batch_args(raw_args)?;
     let instances = discover_instances(&args.data_dir, args.years);
@@ -2507,6 +2819,119 @@ mod tests {
             clean_policy_text("<p>Biaya <b>perolehan</b></p>"),
             "Biaya perolehan"
         );
+    }
+
+    #[test]
+    fn test_unexpected_status_reads_the_code_the_tool_reports() {
+        // Verbatim strings captured from the downloader in this session.
+        assert_eq!(
+            super::unexpected_status("Error: list reports for LCGP: unexpected status 429"),
+            Some(429)
+        );
+        assert_eq!(
+            super::unexpected_status("Error: list reports for CTRA: unexpected status 403"),
+            Some(403)
+        );
+        assert_eq!(
+            super::unexpected_status("gagal: unexpected status 502 for BSDE"),
+            Some(502)
+        );
+        // Nothing to read -> None, never a silent 0.
+        assert_eq!(super::unexpected_status("Authentication successful."), None);
+        assert_eq!(super::unexpected_status("unexpected status"), None);
+        assert_eq!(super::unexpected_status(""), None);
+    }
+
+    #[test]
+    fn test_classify_fetch_separates_the_two_blocks() {
+        use super::FetchOutcome::*;
+        // A dead session and a rate limit are the same generic sentence in the
+        // tool's output and opposite remedies here. This is the test that keeps
+        // them apart: 403 must never be answered by waiting, nor 429 by re-auth.
+        assert_eq!(
+            super::classify_fetch(
+                "Error: list reports for CTRA: unexpected status 403",
+                false,
+                0
+            ),
+            NeedsAuth
+        );
+        assert_eq!(
+            super::classify_fetch(
+                "Error: list reports for LCGP: unexpected status 429",
+                false,
+                0
+            ),
+            RateLimited
+        );
+        // Any other status is an ordinary failure that does not stop the run.
+        assert_eq!(
+            super::classify_fetch("unexpected status 500", false, 0),
+            Failed
+        );
+    }
+
+    #[test]
+    fn test_classify_fetch_judges_by_artifact_not_by_message() {
+        use super::FetchOutcome::*;
+        // The tool reported no filing; nothing landed. That is a published
+        // absence, not a failure, and it must not be counted as one.
+        let nothing = r#"{"downloaded": null, "failed": null}"#;
+        assert_eq!(super::classify_fetch(nothing, true, 0), NotPublished);
+        // Same message, but files exist: the artifact wins.
+        assert_eq!(super::classify_fetch(nothing, true, 3), Fetched);
+        // Success message, no evidence on disk: still not "fetched".
+        assert_eq!(
+            super::classify_fetch("downloaded 2 files", true, 0),
+            NotPublished
+        );
+        // Non-zero exit with nothing on disk is a real failure.
+        assert_eq!(super::classify_fetch("", false, 0), Failed);
+    }
+
+    #[test]
+    fn test_classify_fetch_ignores_a_status_code_in_ordinary_text() {
+        use super::FetchOutcome::*;
+        // A digit group in a filename must not be mistaken for a block. Only the
+        // phrase the tool actually emits decides the verdict.
+        assert_eq!(
+            super::classify_fetch(r#"{"downloaded": "AnnualReport403.pdf"}"#, true, 1),
+            Fetched
+        );
+        assert_eq!(
+            super::classify_fetch("error code 429 in trailing log", true, 0),
+            NotPublished
+        );
+    }
+
+    #[test]
+    fn test_count_files_under_counts_recursively() {
+        let base = std::env::temp_dir().join(format!("idxprism_count_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // Missing directory is zero, not a panic: absence is the common case.
+        assert_eq!(super::count_files_under(&base), 0);
+        std::fs::create_dir_all(base.join("Audit")).unwrap();
+        assert_eq!(super::count_files_under(&base), 0);
+        std::fs::write(base.join("Audit/instance.zip"), b"x").unwrap();
+        std::fs::write(base.join("Audit/report.pdf"), b"y").unwrap();
+        // Nested under a subdirectory of the filing dir still counts.
+        std::fs::create_dir_all(base.join("Audit/nested")).unwrap();
+        std::fs::write(base.join("Audit/nested/extra.pdf"), b"z").unwrap();
+        assert_eq!(super::count_files_under(&base), 3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_corpus_tickers_ignores_years_and_hidden_dirs() {
+        let base = std::env::temp_dir().join(format!("idxprism_tickers_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("CTRA/2024/Audit")).unwrap();
+        std::fs::create_dir_all(base.join("BSDE")).unwrap();
+        std::fs::create_dir_all(base.join(".cache")).unwrap();
+        std::fs::create_dir_all(base.join("2024")).unwrap();
+        std::fs::write(base.join("loose.txt"), b"x").unwrap();
+        assert_eq!(super::corpus_tickers(&base), vec!["BSDE", "CTRA"]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -79,6 +79,11 @@ if [ -e /tmp/sm_bt/PWON/2023/Audit/instance.zip ]; then
   grep -q "^PWON,2023," /tmp/sm_batch.csv && ok "batch row has PWON" || bad "batch row missing"
   # help path
   "$BIN" batch -h >/dev/null 2>&1; check "batch -h" $? 0
+  # help path
+  "$BIN" fetch -h >/dev/null 2>&1; check "fetch -h" $? 0
+  # An unusable downloader must be an error, not a silent no-op.
+  out=$("$BIN" fetch --years 2024-2024 --bin /nonexistent 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && ok "fetch rejects a missing --bin (exit=$rc)" || bad "fetch accepted a missing --bin"
   "$BIN" -h >/dev/null 2>&1; check "extract -h" $? 0
 else
   echo "  skip  batch (no local PWON data)"

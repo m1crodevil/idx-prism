@@ -36,6 +36,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 3. **Market Microstructure & Information Asymmetry**: Computes peer-reviewed econometric proxies (**Corwin-Schultz 2012 spread**, **Zero-Return-Days**, **volatility**, **turnover**) directly from daily OHLCV series.
 4. **Share Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. Page text is rebuilt as visual rows (grouped from word bounding boxes) so bilingual, multi-column tables read as a human sees them, then two gates must pass — **row identity** (the row's own label must be the public holder; management and Total rows are excluded) and **self-consistency** (`public/total == free-float%`). Failing either returns `null` rather than a silently wrong number.
 5. **Universe & Sampling Tools**: Queries and exports official IDX-IC sector listings with purposive filtering options.
+6. **Rate-Disciplined Corpus Acquisition**: Fills the gaps in a downloaded corpus one request per filing, and treats an expired session (`403`) and a rate limit (`429`) as the two distinct stops they are — the downloader reports both with the same generic sentence, which is why they were previously indistinguishable and why a retry loop silently extended the block.
 
 ---
 
@@ -67,7 +68,7 @@ IDX-Prism consolidates these workflows into a single autonomous engine:
 * **Econometric Spread Estimation**: Computes the gold-standard Corwin & Schultz (2012) two-day high-low bid-ask spread estimator, plus Zero-Return-Days and daily-return volatility, to quantify information asymmetry without requiring proprietary intraday tick data.
 * **Share-Ownership Extraction**: Parses the CALK *Modal Saham* note to recover public/free-float shares, percentage, and shares outstanding. A self-consistency gate alone is insufficient — every row satisfies `public/total == printed percent`, including a director's line — so it is paired with a row-identity gate. Either gate failing yields `null`.
 * **Page Provenance and Loud Unreadable-PDF Failure**: Each PDF-derived field records the 1-based page it was anchored to (`pdf_ip_region_page`), so any value can be re-opened and confirmed at its source. A PDF with no extractable text layer (scanned or image-only) fails with an explicit error instead of returning empty fields — otherwise "could not be read" would be indistinguishable from "the note is absent" and would silently shrink the sample.
-* **Sanitized & Portable**: Zero hardcoded local machine paths; configurable via environment variables (`IDXPRISM_DATA`, `IDXPRISM_BIN`).
+* **Sanitized & Portable**: Zero hardcoded local machine paths. The corpus directory is a flag (`-d`), and the downloader `fetch` shells out to is resolved from `--bin`, then `IDXPRISM_BIN`, then `PATH` — it is not on `PATH` in the reference setup. `scripts/smoke_test.sh` takes the corpus from `IDXPRISM_DATA`.
 
 ---
 
@@ -227,7 +228,35 @@ Filings that cannot be extracted are reported on stderr and the process exits no
 
 **`accounting_model` values:** `cost model`, `fair value model`, `revaluation model`, or `unknown`. Classification reads the *measurement sentence* — the one stating how the property is measured **after initial recognition** — rather than mere keyword presence, because every fair-value issuer also writes "at cost on initial recognition", and a keyword match misclassifies them as cost model.
 
-### 5. Vision Validation Channel (`--vlm`)
+### 5. Corpus Acquisition (`fetch`)
+
+Download the filings the corpus is missing, with rate discipline:
+
+```bash
+export IDXPRISM_BIN=~/.idxlens/idxlens          # not on PATH in the reference setup
+idx-prism fetch -d ~/.idxlens/data --years 2024-2025
+```
+
+Tickers come from the corpus itself (any directory that is not a year and not hidden), or from `-t TICKER,TICKER`. Only filings with nothing on disk are requested, so a re-run resumes where the last one stopped and a completed run costs zero requests.
+
+Three rules, each from a measured failure:
+
+1. **One request per filing.** Asking availability first and downloading second doubles the request count against a limit that is itself the binding constraint. Whether a filing exists is decided by the artifact on disk plus the downloader's own status output — not by a pre-check.
+2. **One worker.** The downloader defaults to four concurrent downloads; the limit is counted per IP, so concurrency only spends it faster.
+3. **403 and 429 stop the run immediately.** These are the two failures that get worse when you keep going, and they are the two the downloader reports with the *same* generic sentence (`unexpected status N`), which is why they were previously indistinguishable:
+
+| Status | Meaning | Remedy |
+|---|---|---|
+| `403` | session/challenge expired | run `idxlens auth`, then re-run |
+| `429` | rate limited by IDX | wait out the block window |
+| other | ordinary failure | reported, run continues |
+
+Do not retry a 429 in a loop. Cloudflare blocks for a fixed period regardless of request rate, and its own guidance is that retrying inside that window **extends** the block. Re-authenticating does not clear it either: the limit is counted per IP, so a fresh cookie resets nothing. Wait hours, not seconds.
+
+**Exit codes:** `0` done · `1` some filings failed · `2` session expired (re-auth) · `3` rate limited (wait). The three-way split is deliberate — a filing that was never published is reported as `not published`, separately from a failure, so a coverage number cannot quietly absorb an access problem.
+
+### 6. Vision Validation Channel (`--vlm`)
+
 
 An opt-in **second reading** of the appraiser field by a vision model looking at the rendered page. It exists to satisfy one research requirement: a reported value must be checkable against something that did not produce it. It never overwrites the deterministic fields — it agrees or disagrees with them.
 
